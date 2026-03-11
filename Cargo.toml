@@ -1,0 +1,29 @@
+[package]
+name = "grok-cli"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# The framework to build CLI commands
+clap = { version = "4.4", features = ["derive"] }
+
+# The async runtime (the engine that lets us do multiple things at once)
+tokio = { version = "1.50.0", features = ["full"] }
+
+# The TUI library (the "React" of the terminal)
+ratatui = "0.30.0"
+
+# The terminal backend (handles raw mode, keys, and mouse)
+crossterm = "0.29.0"
+
+# For handling JSON (essential for LLM APIs)
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# For making API calls
+reqwest = { version = "0.13.2", features = ["json", "stream"] }
+
+# Environment vars
+dotenvy = "0.15"
+
+anyhow = "1.0.102"
