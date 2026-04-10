@@ -1,5 +1,6 @@
 mod app;
 mod grok;
+mod tools;
 
 use ratatui::{
     Terminal, backend::CrosstermBackend, layout::{Constraint, Direction, Layout}, style::{Color, Style}, text::{Span, Text}, widgets::{Block, Borders, Paragraph, Wrap}
@@ -30,16 +31,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut app = App::new();
 
-    let (tx, mut rx) = mpsc::channel::<String>(100);
+    let (tx, mut rx) = mpsc::channel::<grok::Message>(100);
 
     dotenvy::dotenv().ok();
     let grok_client = GrokClient::new();
 
     loop {
         if let Ok(response) = rx.try_recv() {
+            let mut display_text = String::new();
+            if let Some(text) = response.content && text != "" {
+                display_text.push_str(&text);
+            } else if let Some(tools) = response.tool_calls {
+                // We will handle the actual tool execution in the next step!
+                for tool in tools {
+                    display_text.push_str(&format!("Grok called tool {}...\n", tool.function.name));
+
+                    match serde_json::from_str::<tools::FileArgs>(&tool.function.arguments) {
+                        Ok(args) => {
+                            let cmd_result = match tool.function.name.as_str() {
+                                "list_files" => tools::list_files(&args.path),
+                                "read_file" => tools::read_file(&args.path),
+                                _ => Err(anyhow::anyhow!("Unknown tool asked by Grok"))
+                            };
+
+                            match cmd_result {
+                                Ok(output) => display_text.push_str(&output),
+                                Err(e) => display_text.push_str(&format!("Error: {}", e)),
+
+                            }
+                        }
+
+                        Err(e) => display_text.push_str(&format!("Error: {}", e)),
+                    }
+                }
+            } else {
+                display_text.push_str("Received empty response");
+            };
             app.messages.push(app::ChatMessage {
                 author: app::Author::System,
-                content: response
+                content: display_text
             });
             app.is_loading = false;
             // app.scroll_to_bottom();
@@ -112,7 +142,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     app::Author::User => "user".to_string(),
                                     app::Author::System => "system".to_string(),
                                 },
-                                content: m.content.clone(),
+                                content: Some(m.content.clone()),
+                                tool_call_id: None,
+                                tool_calls: None
                             });
                         }
 
@@ -125,7 +157,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     let _ = tx_clone.send(response).await;
                                 }
                                 Err(e) => {
-                                    let _ = tx_clone.send(format!("Error: {}", e)).await;
+                                    let _ = tx_clone.send(GrokMessage {
+                                        role: "system".to_string(),
+                                        content: Some(format!("Error: {}", e)),
+                                        tool_call_id: None,
+                                        tool_calls: None
+                                    }).await;
                                 }
                             }
                         });

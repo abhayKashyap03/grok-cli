@@ -3,10 +3,18 @@ use reqwest::Client;
 use std::env;
 use anyhow::Result;
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Message {
     pub role: String,
-    pub content: String,
+
+    #[serde(skip_serializing_if="Option::is_none")]
+    pub content: Option<String>,
+
+    #[serde(skip_serializing_if="Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
+
+    #[serde(skip_serializing_if="Option::is_none")]
+    pub tool_call_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -15,6 +23,9 @@ struct GrokRequest {
     messages: Vec<Message>,
     stream: bool,
     max_completion_tokens: u16,
+
+    #[serde(skip_serializing_if="Option::is_none")]
+    tools: Option<Vec<Tool>>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -25,6 +36,32 @@ struct GrokResponse {
 #[derive(Deserialize, Debug)]
 struct Choice {
     message: Message,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct Function {
+    pub name: String,
+    pub description: String,
+    pub parameters: serde_json::Value,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct Tool {
+    pub r#type: String,
+    pub function: Function,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct FunctionCall {
+    pub name: String,
+    pub arguments: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ToolCall {
+    pub id: String,
+    pub r#type: String,
+    pub function: FunctionCall,
 }
 
 #[derive(Clone)]
@@ -42,12 +79,52 @@ impl GrokClient {
         }
     }
 
-    pub async fn send_chat(&self, messages: Vec<Message>) -> Result<String>{
+    fn get_tools(&self) -> Vec<Tool> {
+        vec![
+            Tool {
+                r#type: "function".to_string(),
+                function: Function {
+                    name: "list_files".to_string(),
+                    description: "Lists all files and directory in the given path. Use this explore project structure.".to_string(),
+                    parameters: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "The directory whose content to list. Use '.' for current directory."
+                            }
+                        },
+                        "required": ["path"]
+                    })
+                }
+            },
+            Tool {
+                r#type: "function".to_string(),
+                function: Function {
+                    name: "read_file".to_string(),
+                    description: "Read the contents of the given file.".to_string(),
+                    parameters: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "Path of the file to read."
+                            }
+                        },
+                        "required": ["path"]
+                    })
+                }
+            }
+        ]
+    }
+
+    pub async fn send_chat(&self, messages: Vec<Message>) -> Result<Message>{
         let request = GrokRequest {
             model: "grok-4-1-fast-non-reasoning".to_string(),
             messages,
             stream: false,
             max_completion_tokens: 1000,
+            tools: Some(self.get_tools())
         };
 
         let response = self.fetch_client.post("https://api.x.ai/v1/chat/completions")
@@ -59,14 +136,11 @@ impl GrokClient {
         let text = response.text().await?;
         
         if !status.is_success() {
-            return Ok(format!("API Error ({}): {}", status, text));
+            anyhow::bail!("API Error ({}): {}", status, text);
         }
 
-        match serde_json::from_str::<GrokResponse>(&text) {
-            Ok(decoded) => Ok(decoded.choices[0].message.content.clone()),
-            Err(e) => {
-                Ok(format!("Deserialization Failed: {}. Raw JSON: {}", e, text))
-            }
-        }     
+        let grok_response: GrokResponse = serde_json::from_str(&text).map_err(|e| anyhow::anyhow!("Deserialization Failed: {}. Raw JSON: {}", e, text))?;
+        
+        Ok(grok_response.choices[0].message.clone())
     }
 }
