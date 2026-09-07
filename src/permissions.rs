@@ -5,7 +5,9 @@
 //!
 //! 1. **deny rules** — an explicit veto, never overridable, not even by
 //!    `bypassPermissions`. If a user writes `deny = ["Bash(rm -rf:*)"]` they
-//!    mean it, and a mode flag should not quietly undo it.
+//!    mean it, and a mode flag should not quietly undo it. A shell command is
+//!    matched whole *and* per segment, so `true; rm -rf /` cannot slip past a
+//!    rule by not starting with the denied text.
 //! 2. **plan mode** — refuses everything that mutates.
 //! 3. **allow rules and session grants** — "yes, and stop asking".
 //! 4. **the mode's default for the tool's kind**.
@@ -27,6 +29,16 @@
 //!
 //! The `:*` suffix is a prefix match on a command, matching Claude Code's
 //! syntax. Everything else is a glob against the call's primary argument.
+//!
+//! ## What rules cannot do
+//!
+//! Matching is textual. It splits a command on shell operators and checks each
+//! segment, which stops the obvious evasions (`;`, `&&`, `|`, `$(…)`), but it
+//! does not understand shell semantics. `rm -fr` does not match a rule written
+//! for `rm -rf`, and a command assembled at runtime from a variable cannot be
+//! seen at all. Deny rules are a guardrail against mistakes and against a model
+//! reaching for something obviously destructive — they are not a sandbox, and
+//! `plan` mode plus an explicit allow-list is the stronger control.
 
 use std::collections::HashSet;
 use std::sync::Arc;

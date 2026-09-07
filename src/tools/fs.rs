@@ -897,11 +897,12 @@ fn search(
                 for &i in &hits {
                     let lo = i.saturating_sub(context_lines);
                     let hi = (i + context_lines).min(lines.len().saturating_sub(1));
-                    for j in lo..=hi {
+                    for (offset, line) in lines[lo..=hi].iter().enumerate() {
+                        let j = lo + offset;
                         // ':' marks the match, '-' marks context — the same
                         // convention grep uses, so the model reads it correctly.
                         let sep = if j == i { ':' } else { '-' };
-                        out.push_str(&format!("{shown}{sep}{}{sep}{}\n", j + 1, lines[j]));
+                        out.push_str(&format!("{shown}{sep}{}{sep}{line}\n", j + 1));
                     }
                 }
             }

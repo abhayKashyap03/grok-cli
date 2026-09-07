@@ -79,10 +79,12 @@ pub fn format_duration(d: std::time::Duration) -> String {
 
 /// Resolve `path` against `workspace`, collapsing `.` and `..` lexically.
 ///
-/// Deliberately *not* `canonicalize`: that requires the path to exist, which is
-/// wrong for a write tool creating a new file, and it resolves symlinks, which
-/// would let a symlink inside the workspace silently escape the sandbox check
-/// in one direction while blocking legitimate paths in the other.
+/// This is only the *lexical* half of the sandbox check. It cannot use
+/// `canonicalize`, which requires the path to exist and so fails for a write
+/// tool creating a new file. Resolving symlinks is therefore done separately,
+/// by `tools::fs::resolve_in_workspace`, which canonicalizes the deepest
+/// existing ancestor — without that second step a symlink inside the workspace
+/// reads and writes anywhere on the disk while passing this check cleanly.
 pub fn resolve(workspace: &Path, path: &str) -> PathBuf {
     let raw = Path::new(path);
     let joined = if raw.is_absolute() { raw.to_path_buf() } else { workspace.join(raw) };

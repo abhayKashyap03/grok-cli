@@ -8,14 +8,16 @@ it has the reasoning behind the layering, which the code does not repeat.
 ## Commands
 
 ```bash
-cargo test                        # 264 tests; run this before every commit
+cargo test                        # 281 tests; run this before every commit
+cargo clippy --all-targets        # must stay clean
 cargo build
 cargo test --test end_to_end      # agent against a scripted mock API
+cargo test --test sandbox         # security boundaries
 ./target/debug/grok-cli doctor    # verify XAI_API_KEY and the endpoint
 ```
 
-There is no linter configured beyond `cargo`'s own warnings. The build is
-expected to be warning-free; do not commit with warnings outstanding.
+The build and clippy are both warning-free. Do not commit with either
+outstanding.
 
 ## Layout
 
@@ -51,7 +53,17 @@ are each one self-contained concern. `src/cli.rs` wires it all together.
   corrupt files via `write_file`. `edit_file` has a deliberate recovery ladder
   for near-miss `old_string` values; both rungs require a *unique* match.
 - **Deny rules are checked before everything, including `bypassPermissions`.**
-  That ordering is the feature. Do not "simplify" it.
+  That ordering is the feature. Do not "simplify" it. Commands are matched
+  whole *and* per shell segment; compound commands are never grantable.
+- **Subagents go through the permission engine too.** Restricting a subagent's
+  toolset is not a boundary on its own — an earlier version did only that, and
+  delegation escaped every deny rule and plan mode. If you touch `subagent.rs`,
+  keep `authorize` on the path.
+- **The sandbox needs both a lexical and a physical check.** Lexical alone
+  misses symlinks; canonicalizing the whole path breaks new-file creation.
+- **The TUI must never lock the agent to change mode.** A turn holds that mutex
+  for its whole duration; taking it from a key handler freezes the event loop,
+  including the Esc that would cancel the turn.
 - **`SessionStore` takes its root explicitly.** It used to read `$HOME` inside
   every call, which made three tests race under parallel execution. Do not
   reintroduce implicit global state.
@@ -62,9 +74,14 @@ are each one self-contained concern. `src/cli.rs` wires it all together.
 
 ## Testing philosophy
 
-Three layers, and the third exists because the first two missed real bugs:
-unit tests, render tests against `ratatui::TestBackend`, and end-to-end tests
-against a mock API that splits SSE frames at awkward byte boundaries.
+Four layers, and each later one exists because the earlier ones missed real
+bugs: unit tests, render tests against `ratatui::TestBackend`, end-to-end tests
+against a mock API that splits SSE frames at awkward byte boundaries, and
+`tests/sandbox.rs`, which probes security boundaries directly.
+
+If you write a doc comment claiming a security property, write the test too. A
+review found four bypasses that all lived in the gap between passing component
+tests and a property nobody had asserted.
 
 Behaviour discovered by running the real binary — against the live model, or in
 a real pseudo-terminal — gets a regression test. If you fix something found

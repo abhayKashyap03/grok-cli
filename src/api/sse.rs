@@ -14,10 +14,19 @@ use crate::api::types::{
     ChatChunk, Completion, Message, Role, StreamEvent, ToolCall, Usage,
 };
 
+/// Largest partial event held while waiting for its terminator.
+///
+/// An endpoint that never sends a blank line would otherwise grow this without
+/// limit. The base URL is user-configurable, so that endpoint is not
+/// necessarily trustworthy.
+const MAX_PENDING_EVENT_BYTES: usize = 8 * 1024 * 1024;
+
 /// Incrementally extracts SSE `data:` payloads from a byte stream.
 #[derive(Debug, Default)]
 pub struct SseDecoder {
     buffer: String,
+    /// Set once the buffer has overflowed, so the error is reported once.
+    overflowed: bool,
 }
 
 impl SseDecoder {
@@ -31,8 +40,25 @@ impl SseDecoder {
     /// character at a chunk boundary is a transport artifact, not a protocol
     /// error, and dropping the whole stream over it would be wrong.
     pub fn push(&mut self, bytes: &[u8]) -> Vec<String> {
+        if self.overflowed {
+            return Vec::new();
+        }
         self.buffer.push_str(&String::from_utf8_lossy(bytes));
+        if self.buffer.len() > MAX_PENDING_EVENT_BYTES {
+            tracing::warn!(
+                bytes = self.buffer.len(),
+                "discarding an oversized SSE event with no terminator"
+            );
+            self.buffer.clear();
+            self.overflowed = true;
+            return Vec::new();
+        }
         self.drain()
+    }
+
+    /// Whether the stream exceeded the per-event limit and was abandoned.
+    pub fn overflowed(&self) -> bool {
+        self.overflowed
     }
 
     fn drain(&mut self) -> Vec<String> {

@@ -57,7 +57,11 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 strip = "symbols"
-panic = "abort"
+# Deliberately NOT panic = "abort". Aborting skips unwinding, so no Drop impl
+# runs — including the `kill_on_drop` that reaps background shells and MCP
+# server processes. A panic would leave those orphaned. The binary is slightly
+# larger; orphaned child processes are worse.
+panic = "unwind"
 
 [profile.dev]
 opt-level = 0

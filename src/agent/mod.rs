@@ -781,7 +781,9 @@ mod tests {
 
     #[test]
     fn plan_mode_hides_mutating_tools_instead_of_advertising_and_refusing_them() {
-        let mut agent = test_agent(std::env::temp_dir());
+        // `set_mode` takes &self now: the mode lives behind an atomic so the UI
+        // can change it without locking the agent.
+        let agent = test_agent(std::env::temp_dir());
         assert!(agent.visible_tools().get("bash").is_some());
 
         agent.permissions.set_mode(PermissionMode::Plan);

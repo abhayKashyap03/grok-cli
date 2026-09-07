@@ -122,7 +122,13 @@ ask   = ["Bash(git push:*)"]
 
 Rules are `Tool(pattern)`. `cmd:*` is a prefix match, anything else is a glob,
 and a bare `Tool` matches every call. **Deny always wins** — including over
-`bypassPermissions`.
+`bypassPermissions`, and including inside subagents.
+
+Shell commands are matched whole *and* per segment, so `true; rm -rf /` cannot
+slip past a rule by not starting with the denied text. Matching is still
+textual, though: `rm -fr` is not `rm -rf`, and a command built from a variable
+cannot be inspected. Treat deny rules as a guardrail against mistakes, not a
+sandbox — `plan` mode with an explicit allow-list is the stronger control.
 
 `grok config` prints what actually resolved.
 
@@ -198,13 +204,15 @@ test commands, real conventions, the gotcha that has already bitten someone.
 ## Development
 
 ```bash
-cargo test           # 264 tests
+cargo test           # 281 tests
+cargo clippy --all-targets
 cargo build --release
 ```
 
-Three layers: unit tests beside the code, render tests driving the real UI
-against an in-memory terminal, and end-to-end tests driving the real agent
-against a scripted mock of the xAI API.
+Four layers: unit tests beside the code, render tests driving the real UI
+against an in-memory terminal, end-to-end tests driving the real agent against
+a scripted mock of the xAI API, and sandbox tests probing the security
+boundaries directly.
 
 [ARCHITECTURE.md](ARCHITECTURE.md) explains how the pieces fit and why they are
 arranged that way.

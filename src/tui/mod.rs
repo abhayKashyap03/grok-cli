@@ -760,7 +760,13 @@ async fn handle_overlay_key(
                 app.textarea.insert_char(c);
                 let text = app.textarea.text();
                 let matches = commands::complete(&text, &app.config.workspace);
-                if matches.is_empty() {
+                let typed = text.trim_start_matches('/');
+
+                // Once the typed text *is* a command, the palette has nothing
+                // left to offer and must get out of the way — otherwise Enter
+                // is consumed as "complete the selection" and every slash
+                // command needs Enter pressed twice.
+                if matches.is_empty() || matches.iter().any(|m| m.name == typed) {
                     app.overlay = Overlay::None;
                 } else {
                     app.overlay = Overlay::Palette { entries: matches, selected: 0 };
@@ -831,20 +837,22 @@ async fn submit(
     let action = commands::dispatch(&text, &app.config.workspace);
 
     // Commands needing live state are answered here, where that state exists.
+    // `try_lock` rather than `lock`: a turn holds the agent's mutex for its
+    // whole duration, and blocking here would freeze the event loop.
     let action = match &action {
-        CommandAction::Unknown(name) => {
-            let guard = agent.lock().await;
-            match name.as_str() {
+        CommandAction::Report(name) => match agent.try_lock() {
+            Ok(guard) => match name.as_str() {
                 "context" => CommandAction::Show(context_report(app, &guard)),
                 "cost" => CommandAction::Show(cost_report(app)),
                 "tools" => CommandAction::Show(tools_report(&guard)),
                 "mcp" => CommandAction::Show(mcp_report(&guard)),
                 "agents" => CommandAction::Show(agents_report(&guard)),
-                other => CommandAction::Show(format!(
-                    "Unknown command `/{other}`. Type /help to see what is available."
-                )),
-            }
-        }
+                other => CommandAction::Show(format!("`/{other}` has no report")),
+            },
+            Err(_) => CommandAction::Show(format!(
+                "/{name} needs the agent, which is busy with the current turn. Try again once it finishes."
+            )),
+        },
         _ => action,
     };
 
@@ -964,7 +972,15 @@ async fn submit(
             start_turn(prompt, app, agent, event_tx, turn, cancel).await;
         }
         CommandAction::Unknown(name) => {
-            app.notice(format!("Unknown command `/{name}`."), NoticeLevel::Error);
+            app.notice(
+                format!("Unknown command `/{name}`. Type /help to see what is available."),
+                NoticeLevel::Error,
+            );
+        }
+        // Rewritten above into a Show once the agent could be inspected;
+        // reaching here would mean that lookup was skipped.
+        CommandAction::Report(name) => {
+            app.notice(format!("`/{name}` could not be produced."), NoticeLevel::Error);
         }
     }
 }

@@ -284,7 +284,7 @@ fn print_sessions(workspace: &std::path::Path) -> Result<()> {
         println!("No sessions for {}", workspace.display());
         return Ok(());
     }
-    println!("{:<10}  {:<7}  {:<26}  {}", "ID", "MSGS", "MODEL", "TITLE");
+    println!("{:<10}  {:<7}  {:<26}  TITLE", "ID", "MSGS", "MODEL");
     for session in sessions {
         println!(
             "{:<10}  {:<7}  {:<26}  {}",

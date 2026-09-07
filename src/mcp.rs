@@ -37,6 +37,9 @@ const PROTOCOL_VERSION: &str = "2024-11-05";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// Cap on a tool result, matching the local tools' bound.
 const MAX_RESULT_BYTES: usize = 64 * 1024;
+/// Longest single JSON-RPC frame accepted from a server. A server emitting one
+/// enormous line with no newline would otherwise grow memory without limit.
+const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
 /// Namespaced name for a tool borrowed from `server`.
 pub fn namespaced(server: &str, tool: &str) -> String {
@@ -70,9 +73,12 @@ impl Connection {
         self.pending.lock().await.insert(id, tx);
 
         let body = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
-        self.send_raw(&body).await.inspect_err(|_| {
-            // Nothing will ever answer this id; do not leak the slot.
-        })?;
+        if let Err(e) = self.send_raw(&body).await {
+            // Nothing will ever answer this id, so drop the slot rather than
+            // leaving a dead waiter in the map for the life of the connection.
+            self.pending.lock().await.remove(&id);
+            return Err(e);
+        }
 
         match tokio::time::timeout(REQUEST_TIMEOUT, rx).await {
             Err(_) => {
@@ -134,6 +140,10 @@ impl McpServer {
         tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {
+                if line.len() > MAX_FRAME_BYTES {
+                    tracing::warn!(bytes = line.len(), "discarding an oversized MCP frame");
+                    continue;
+                }
                 let Ok(message) = serde_json::from_str::<Value>(&line) else {
                     tracing::warn!(line, "unparseable MCP frame");
                     continue;

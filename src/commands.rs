@@ -30,6 +30,15 @@ use crate::config::PermissionMode;
 pub enum CommandAction {
     /// Show text in the transcript. No model call.
     Show(String),
+    /// A report only the front end can produce, because it needs live state
+    /// (the running agent, its usage, its connected servers). Carries the
+    /// command name; the front end matches on it.
+    ///
+    /// This is a distinct variant rather than a `Show` placeholder because a
+    /// placeholder is indistinguishable from a real answer: an earlier version
+    /// returned `Show("/agents is unavailable right now")`, the UI never
+    /// noticed, and five commands silently printed that instead of working.
+    Report(String),
     /// Send this text to the model as a user message.
     Prompt(String),
     /// Switch model.
@@ -240,11 +249,9 @@ pub fn dispatch(input: &str, workspace: &Path) -> CommandAction {
                 )),
             }
         }
-        // These need live state the UI holds, so it intercepts them before
-        // reaching here. Reaching this arm means the UI forgot one; say so
-        // rather than silently doing nothing.
+        // These need live state only the front end has.
         "context" | "cost" | "tools" | "mcp" | "agents" => {
-            CommandAction::Show(format!("/{name} is unavailable right now"))
+            CommandAction::Report(name.to_string())
         }
         other => CommandAction::Unknown(other.to_string()),
     }

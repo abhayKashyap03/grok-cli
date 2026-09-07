@@ -14,7 +14,6 @@
 use std::sync::Arc;
 
 use grok_cli::agent::{Agent, AgentEvent, StopReason};
-use grok_cli::api::Message;
 use grok_cli::config::{Config, PermissionMode, PermissionRules};
 use grok_cli::session::Session;
 use grok_cli::tools::ToolRegistry;

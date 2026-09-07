@@ -12,6 +12,12 @@ use crate::util;
 
 /// Cap on fetched page text handed to the model.
 const MAX_FETCH_BYTES: usize = 96 * 1024;
+/// Cap on bytes read off the wire, applied *while* reading.
+///
+/// Larger than the text cap because markup compresses away, but bounded: the
+/// model picks the URL from untrusted context, so the server may be hostile or
+/// simply enormous.
+const MAX_DOWNLOAD_BYTES: usize = 8 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // todo_write
@@ -175,13 +181,42 @@ impl Tool for WebFetch {
         };
 
         let status = response.status();
-        let body = match response.text().await {
-            Ok(t) => t,
-            Err(e) => return Ok(ToolOutcome::error(format!("cannot read body of {url}: {e}"))),
-        };
-
         if !status.is_success() {
             return Ok(ToolOutcome::error(format!("{url} returned HTTP {status}")));
+        }
+
+        // Read incrementally with a hard cap rather than calling `.text()`,
+        // which materializes the whole body first. The model chooses the URL
+        // from untrusted context, so the server on the other end may be hostile
+        // — or merely enormous — and truncating after the fact is too late.
+        let mut collected: Vec<u8> = Vec::new();
+        let mut stream = response.bytes_stream();
+        let mut truncated = false;
+        loop {
+            let next = tokio::select! {
+                biased;
+                () = ctx.cancel.cancelled() => {
+                    return Ok(ToolOutcome::error("fetch interrupted by the user"));
+                }
+                chunk = futures_util::StreamExt::next(&mut stream) => chunk,
+            };
+            let Some(chunk) = next else { break };
+            match chunk {
+                Err(e) => return Ok(ToolOutcome::error(format!("cannot read body of {url}: {e}"))),
+                Ok(bytes) => {
+                    collected.extend_from_slice(&bytes);
+                    if collected.len() >= MAX_DOWNLOAD_BYTES {
+                        collected.truncate(MAX_DOWNLOAD_BYTES);
+                        truncated = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        let body = String::from_utf8_lossy(&collected).into_owned();
+        if truncated {
+            tracing::warn!(url, "response exceeded the fetch limit and was truncated");
         }
 
         let text = strip_html(&body);

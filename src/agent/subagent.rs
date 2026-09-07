@@ -17,10 +17,14 @@
 //! files to answer one question should not leave thirty files in the parent's
 //! context — the subagent burns its own window and returns a paragraph.
 //!
-//! Two safety properties matter and are enforced here rather than trusted:
+//! Three safety properties matter and are enforced here rather than trusted:
 //!
-//! * a subagent's tools are a **subset** of the parent's, never a superset, so
-//!   delegation can not be used to escape a restriction; and
+//! * a subagent's tools are a **subset** of the parent's, never a superset;
+//! * every delegated tool call goes through the **same permission engine** as a
+//!   top-level one, sharing the parent's mode cell so plan mode and deny rules
+//!   reach delegated work. Restricting the toolset alone is *not* a boundary —
+//!   an earlier version did only that, and a subagent granted `bash` ran
+//!   commands the parent's deny rules forbid, unprompted; and
 //! * subagents cannot spawn subagents, so a recursive definition cannot fork
 //!   until the machine falls over.
 

@@ -86,11 +86,20 @@ declaring how dangerous it is.
 
 Every filesystem tool resolves its path through one function,
 `fs::resolve_in_workspace`, which is the only thing standing between a confused
-model and the rest of the disk. Resolution alone is not enough — `../../etc/passwd`
-resolves fine — so containment is checked explicitly. Paths are resolved
-lexically rather than with `canonicalize`, which would fail for a file being
-created and would resolve symlinks in ways that break the check in both
-directions.
+model and the rest of the disk. It does two checks, and both are necessary:
+
+- **Lexical**, which catches `../../etc/passwd` even when nothing on that path
+  exists yet — the case a write tool creating a new file hits.
+- **Physical**, which canonicalizes the deepest *existing* ancestor and
+  re-checks containment.
+
+The second was missing at first, and the reasoning that omitted it was wrong in
+an instructive way: the original comment argued that `canonicalize` would
+*cause* symlink escapes. It is what prevents them. Without it a symlink inside
+the workspace — trivially created by an earlier `bash` call, or simply checked
+into a cloned repo — read and wrote anywhere on the disk while passing the
+lexical check cleanly. It cannot canonicalize the whole path, because the file
+may not exist yet, hence the deepest-existing-ancestor walk.
 
 Output is bounded everywhere. A tool result goes straight into the model's
 context, so an unbounded `grep` across a monorepo does not merely run slowly —
@@ -149,6 +158,20 @@ Session grants ("always allow") are keyed by tool *and* argument, so approving
 `cargo test` never silently approves `rm -rf /`. For commands the key is the
 first two words — the granularity users actually mean, without re-prompting on
 every changed flag.
+
+That fingerprint is only safe for a *single* command. `npm install` and
+`npm install && rm -rf /` share their first two words, so a compound command is
+neither stored as a grant nor matched against one. For the same reason deny
+rules are matched against the whole command *and* each segment of it: otherwise
+`true; rm -rf /` slips past `Bash(rm -rf:*)` merely by not starting with the
+denied text, and an allow rule for `git status` smuggles in whatever follows a
+`&&`.
+
+The honest limit: matching is textual. Splitting on shell operators stops the
+obvious evasions, but `rm -fr` does not match a rule written for `rm -rf`, and
+a command assembled from a variable cannot be seen at all. Deny rules are a
+guardrail against mistakes, not a sandbox. Plan mode plus an explicit allow-list
+is the stronger control.
 
 Plan mode **hides** mutating tools rather than advertising and refusing them. A
 tool the model can see, it will try, and burning a turn on a guaranteed refusal
@@ -228,16 +251,25 @@ Markdown definitions in `.grok/agents/`. The point is **context isolation**,
 not parallelism: a search that reads thirty files to answer one question should
 not leave thirty files in the parent's context.
 
-Two properties are enforced rather than trusted:
+Three properties are enforced rather than trusted:
 
-- a subagent's tools are **intersected** with the parent's, never unioned, so
-  delegation cannot be used to escape a restriction;
+- a subagent's tools are **intersected** with the parent's, never unioned;
+- every delegated tool call goes through the **same permission engine** as a
+  top-level one, sharing the parent's mode cell so plan mode and deny rules
+  govern delegated work;
 - `task` is excluded from the subset, so subagents cannot spawn subagents and
   a recursive definition cannot fork until the machine falls over.
 
-Subagents run without prompting. They are confined to already-permitted tools,
-and a prompt from a nested loop whose context the user cannot see is worse than
-no prompt.
+The second was the serious omission. An earlier version enforced only the
+toolset restriction, and the module doc claimed on that basis that delegation
+"cannot be used to escape a restriction". It could: a subagent granted `bash`
+ran commands the parent's deny rules forbid, in plan mode, unprompted, because
+nothing on the delegated path consulted the engine. Restricting *what tools
+exist* is not the same as restricting *what they may do*.
+
+Delegated calls that need approval prompt through the parent's channel,
+attributed `[agent-name] Bash(…)` so the user knows a nested agent is asking.
+With no channel — headless without `--yes` — they are refused.
 
 ## The terminal
 
@@ -276,6 +308,12 @@ Other decisions worth knowing:
 - **Frames below 4x4 are skipped.** A terminal reporting 0x0 (transient during
   resize, persistent under some multiplexers) otherwise redraws forever,
   emitting megabytes of control sequences and nothing else.
+- **The UI never takes the agent's lock to change mode.** A turn holds that
+  mutex for its whole duration, so `Shift+Tab` mid-turn froze the entire event
+  loop — including the `Esc` that would have cancelled the turn. The permission
+  mode lives behind an atomic `ModeCell` precisely so that key stays live.
+  Model changes are recorded on the UI and applied at the start of the next
+  turn, which is the only point the lock is taken anyway.
 
 ## Headless mode
 
@@ -304,7 +342,7 @@ unattended run into an unsupervised one; that is what `--yes` is for.
 
 ## Testing
 
-264 tests, in three layers:
+281 tests, in four layers:
 
 - **Unit tests** next to the code, covering the awkward cases directly: SSE
   frames split mid-JSON, parallel tool calls interleaved, `..` escaping the
@@ -315,8 +353,18 @@ unattended run into an unsupervised one; that is what `--yes` is for.
 - **End-to-end tests** driving the real agent against a scripted mock of the
   xAI API. This is where the tool-call pairing invariant is pinned, by
   inspecting what the second request actually contained.
+- **Sandbox tests** probing the containment and delegation boundaries directly
+  rather than through a model. A model that declines to attempt an escape
+  proves nothing about whether the escape exists.
 
 Behaviour found only by running the real thing — the `edit_file` prefix
 corruption, the 0x0 terminal spin, the missing-TTY error — has a regression
-test each. Neither would have been caught by testing components in isolation,
-which is the argument for doing both.
+test each.
+
+An adversarial review pass then found four permission-boundary bypasses that
+all of those layers had missed: the subagent bypass, the symlink escape, and
+two command-chaining evasions. Every one now has a test that fails against the
+old code. The pattern is worth naming — each lived in the gap between a
+component's own tests, which passed, and a property nobody had written down as
+an assertion. **When a doc comment claims a security property, that claim needs
+a test, or it is just a comment.**
