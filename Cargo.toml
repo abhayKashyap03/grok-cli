@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 # The framework to build CLI commands
-clap = { version = "4.4", features = ["derive"] }
+clap = { version = "4.4", features = ["derive", "env"] }
 
 # The async runtime (the engine that lets us do multiple things at once)
 tokio = { version = "1.50.0", features = ["full"] }
@@ -14,7 +14,7 @@ tokio = { version = "1.50.0", features = ["full"] }
 ratatui = "0.30.0"
 
 # The terminal backend (handles raw mode, keys, and mouse)
-crossterm = "0.29.0"
+crossterm = { version = "0.29.0", features = ["event-stream"] }
 
 # For handling JSON (essential for LLM APIs)
 serde = { version = "1.0", features = ["derive"] }
@@ -27,3 +27,38 @@ reqwest = { version = "0.13.2", features = ["json", "stream"] }
 dotenvy = "0.15"
 
 anyhow = "1.0.102"
+thiserror = "2.0.20"
+tokio-util = "0.7.19"
+futures = "0.3.34"
+async-trait = "0.1.92"
+ignore = "0.4.33"
+globset = "0.4.20"
+regex = "1.13.1"
+similar = "3.2.0"
+dirs = "7.0.0"
+uuid = { version = "1.26.0", features = ["v4", "serde"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+tracing-appender = "0.2.5"
+shell-words = "1.1.1"
+unicode-width = "0.2.2"
+pulldown-cmark = "0.13.4"
+toml = "1.1.5"
+bytes = "1.12.1"
+textwrap = "0.16.2"
+futures-util = "0.3.34"
+serde_yaml = "0.9.34"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
+
+[profile.dev]
+opt-level = 0
+debug = 1
