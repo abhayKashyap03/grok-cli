@@ -6,7 +6,7 @@
 //! made to escape the workspace. Those are properties of the set, and a new
 //! tool added without them would otherwise slip through.
 
-use grok_cli::tools::{Tool, ToolContext, ToolRegistry};
+use grok_cli::tools::{ToolContext, ToolRegistry};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
