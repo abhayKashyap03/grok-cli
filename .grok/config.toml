@@ -1,0 +1,35 @@
+# Project settings for grok-cli, working on itself.
+#
+# Layered over ~/.grok/config.toml. Scalars here win; permission rules add to
+# whatever you have set globally. `grok config` prints what actually resolved.
+
+model = "grok-4-1-fast-non-reasoning"
+permission_mode = "default"
+
+[permissions]
+# Pre-approved because they are read-only or trivially reversible, and being
+# asked about them on every turn is what makes people reach for --yes.
+allow = [
+    "Bash(cargo check:*)",
+    "Bash(cargo test:*)",
+    "Bash(cargo build:*)",
+    "Bash(cargo fmt:*)",
+    "Bash(git status:*)",
+    "Bash(git diff:*)",
+    "Bash(git log:*)",
+]
+
+# Deny beats everything, including bypassPermissions. These are the actions
+# that are hard to undo or that leak credentials.
+deny = [
+    "Read(.env)",
+    "Bash(rm -rf:*)",
+    "Bash(git push --force:*)",
+]
+
+# Allowed, but always worth a look first.
+ask = [
+    "Bash(git push:*)",
+    "Bash(git commit:*)",
+    "Bash(cargo publish:*)",
+]
