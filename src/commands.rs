@@ -306,7 +306,7 @@ fn help_text(workspace: &Path) -> String {
     out.push_str(
         "\nKeys\n\n  \
          Enter               send\n  \
-         Shift+Enter         newline\n  \
+         Ctrl+J              newline (Shift+Enter where supported)\n  \
          Esc                 interrupt the current turn\n  \
          Ctrl+C              interrupt, or quit when idle\n  \
          Ctrl+D              quit\n  \

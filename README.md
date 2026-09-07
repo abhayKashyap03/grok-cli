@@ -63,7 +63,7 @@ grok --resume a1b2c3                    # resume a specific one
 | Key | Does |
 | --- | --- |
 | `Enter` | send |
-| `Shift+Enter` | newline |
+| `Ctrl+J` | newline (`Shift+Enter` too, where the terminal reports it) |
 | `Esc` | interrupt the current turn |
 | `Ctrl+C` | interrupt, or press twice to exit |
 | `Shift+Tab` | cycle permission mode |

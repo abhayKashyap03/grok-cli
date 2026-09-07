@@ -74,6 +74,15 @@ pub enum NoticeLevel {
     Success,
 }
 
+/// Whether an overlay consumed the key or wants the caller to submit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverlayOutcome {
+    /// The overlay handled it; nothing further to do.
+    Consumed,
+    /// Close the overlay and submit what is in the input box.
+    SubmitNow,
+}
+
 /// A modal covering the transcript.
 pub enum Overlay {
     None,
@@ -387,7 +396,25 @@ pub async fn run(mut agent: Agent, store: Option<SessionStore>) -> Result<()> {
     let agent = Arc::new(Mutex::new(agent));
 
     let mut terminal = setup_terminal()?;
-    let mut keys = EventStream::new();
+
+    // Terminal events are read on their own task and forwarded over a channel
+    // rather than polled directly in the select! below.
+    //
+    // `select!` drops every branch's future except the one it chooses, and
+    // crossterm's EventStream makes no cancel-safety guarantee — so polling it
+    // inline intermittently loses keystrokes. That showed up as `/quit`
+    // sometimes doing nothing at all. An mpsc receiver *is* cancel-safe, so a
+    // key that has been read can never be dropped on the floor.
+    let (key_tx, mut key_rx) = mpsc::channel::<std::io::Result<Event>>(256);
+    let reader = tokio::spawn(async move {
+        let mut keys = EventStream::new();
+        while let Some(event) = keys.next().await {
+            if key_tx.send(event).await.is_err() {
+                break;
+            }
+        }
+    });
+
     let mut ticker = tokio::time::interval(Duration::from_millis(90));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -434,7 +461,7 @@ pub async fn run(mut agent: Agent, store: Option<SessionStore>) -> Result<()> {
                 app.overlay = Overlay::Permission(Box::new(request));
             }
 
-            maybe_key = keys.next() => {
+            maybe_key = key_rx.recv() => {
                 match maybe_key {
                     None => break Ok(()),
                     Some(Err(e)) => break Err(anyhow::anyhow!("terminal input failed: {e}")),
@@ -465,6 +492,7 @@ pub async fn run(mut agent: Agent, store: Option<SessionStore>) -> Result<()> {
     // Stop any in-flight turn before tearing the terminal down, so a running
     // command cannot scribble over the restored screen.
     cancel.cancel();
+    reader.abort();
     if let Some(handle) = turn {
         let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
     }
@@ -579,7 +607,13 @@ async fn handle_key(
     // An open overlay takes every key: a modal that leaks keystrokes to the
     // input box behind it is how people accidentally send half a prompt.
     if !matches!(app.overlay, Overlay::None) {
-        handle_overlay_key(key, app, mode_cell).await;
+        if handle_overlay_key(key, app, mode_cell).await == OverlayOutcome::SubmitNow
+            && !app.busy
+            && !app.textarea.is_empty()
+        {
+            let text = app.textarea.take();
+            submit(text, app, agent, event_tx, turn, cancel, store, mode_cell).await;
+        }
         return;
     }
 
@@ -642,6 +676,13 @@ async fn handle_key(
         }
 
         // -- submission -----------------------------------------------------
+        //
+        // Ctrl+J is the portable newline. Shift+Enter only reaches an
+        // application when the terminal implements an enhanced keyboard
+        // protocol; in Terminal.app and most others it is byte-identical to
+        // plain Enter, so relying on it alone leaves users with no way to write
+        // a multi-line prompt at all.
+        KeyCode::Char('j') if ctrl => app.textarea.insert_newline(),
         KeyCode::Enter if shift || alt => app.textarea.insert_newline(),
         KeyCode::Enter => {
             if app.busy || app.textarea.is_empty() {
@@ -714,7 +755,7 @@ async fn handle_overlay_key(
     key: KeyEvent,
     app: &mut App,
     mode_cell: &crate::permissions::ModeCell,
-) {
+) -> OverlayOutcome {
     match &mut app.overlay {
         Overlay::None => {}
 
@@ -728,7 +769,7 @@ async fn handle_overlay_key(
             if let Some(answer) = answer {
                 let Overlay::Permission(request) = std::mem::replace(&mut app.overlay, Overlay::None)
                 else {
-                    return;
+                    return OverlayOutcome::Consumed;
                 };
                 let label = match answer {
                     PermissionResponse::Once => "approved",
@@ -745,9 +786,30 @@ async fn handle_overlay_key(
             KeyCode::Up => *selected = selected.saturating_sub(1),
             KeyCode::Down => *selected = (*selected + 1).min(entries.len().saturating_sub(1)),
             KeyCode::Esc => app.overlay = Overlay::None,
-            KeyCode::Enter | KeyCode::Tab => {
+            KeyCode::Tab => {
                 let name = entries.get(*selected).map(|c| c.name.clone());
                 app.overlay = Overlay::None;
+                if let Some(name) = name {
+                    app.textarea.set_text(&format!("/{name} "));
+                }
+            }
+            KeyCode::Enter => {
+                // Enter means "send what I typed" whenever that is already a
+                // real command — `/q` must quit, not silently expand to
+                // `/quit ` and wait for a second Enter. Tab is the key for
+                // completing; Enter completing too made every abbreviation
+                // need two presses.
+                let typed = app.textarea.text();
+                let dispatches = !matches!(
+                    commands::dispatch(&typed, &app.config.workspace),
+                    CommandAction::Unknown(_)
+                );
+                let name = entries.get(*selected).map(|c| c.name.clone());
+                app.overlay = Overlay::None;
+
+                if dispatches {
+                    return OverlayOutcome::SubmitNow;
+                }
                 if let Some(name) = name {
                     app.textarea.set_text(&format!("/{name} "));
                 }
@@ -783,7 +845,7 @@ async fn handle_overlay_key(
                 let kind = *kind;
                 let chosen = entries.get(*selected).cloned();
                 app.overlay = Overlay::None;
-                let Some(chosen) = chosen else { return };
+                let Some(chosen) = chosen else { return OverlayOutcome::Consumed };
                 match kind {
                     PickerKind::Model => {
                         // Recorded on the App and pushed to the agent when the
@@ -820,6 +882,7 @@ async fn handle_overlay_key(
             _ => {}
         },
     }
+    OverlayOutcome::Consumed
 }
 
 /// Handle a submitted line: a slash command, or a prompt for the model.
@@ -1271,6 +1334,112 @@ mod tests {
 
         assert_eq!(a.usage.total_tokens, 460);
         assert_eq!(a.context_tokens, 340, "context tracks the latest prompt, not the sum");
+    }
+
+    /// Feed a line of characters through the same path a real keypress takes,
+    /// so the palette's open/close behaviour is exercised, not simulated.
+    async fn type_line(app: &mut App, text: &str) {
+        let cell = crate::permissions::PermissionEngine::default().mode_cell();
+        for c in text.chars() {
+            if matches!(app.overlay, Overlay::None) {
+                app.textarea.insert_char(c);
+                if c == '/' && app.textarea.text() == "/" {
+                    app.overlay = Overlay::Palette {
+                        entries: commands::all(&app.config.workspace),
+                        selected: 0,
+                    };
+                }
+            } else {
+                let _ = handle_overlay_key(
+                    KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE),
+                    app,
+                    &cell,
+                )
+                .await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_palette_closes_once_the_typed_text_is_a_whole_command() {
+        // While the palette is open it consumes Enter as "complete the
+        // selection", so a command typed in full would need Enter twice.
+        for command in ["/quit", "/help", "/compact", "/agents"] {
+            let mut a = app();
+            type_line(&mut a, command).await;
+
+            assert!(
+                matches!(a.overlay, Overlay::None),
+                "palette still open after typing {command} in full"
+            );
+            assert_eq!(a.textarea.text(), command, "the typed text was mangled");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_palette_stays_open_while_the_command_is_still_ambiguous() {
+        let mut a = app();
+        type_line(&mut a, "/co").await;
+        assert!(
+            matches!(a.overlay, Overlay::Palette { .. }),
+            "the palette should still be offering completions for /co"
+        );
+    }
+
+    #[tokio::test]
+    async fn enter_in_the_palette_submits_an_abbreviation_rather_than_expanding_it() {
+        // `/q` is a real command. With the palette open, Enter used to expand
+        // it to `/quit ` and wait for a second Enter, so the abbreviation
+        // appeared to do nothing.
+        let cell = crate::permissions::PermissionEngine::default().mode_cell();
+
+        for abbreviation in ["/q", "/quit", "/exit"] {
+            let mut a = app();
+            type_line(&mut a, abbreviation).await;
+
+            // Force the palette open even when the text is already complete,
+            // to prove Enter submits from inside it.
+            a.overlay = Overlay::Palette {
+                entries: commands::all(&a.config.workspace),
+                selected: 0,
+            };
+
+            let outcome = handle_overlay_key(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                &mut a,
+                &cell,
+            )
+            .await;
+
+            assert_eq!(
+                outcome,
+                OverlayOutcome::SubmitNow,
+                "Enter on {abbreviation} must submit, not complete"
+            );
+            assert_eq!(a.textarea.text(), abbreviation, "the text must not be rewritten");
+            assert!(matches!(a.overlay, Overlay::None));
+        }
+    }
+
+    #[tokio::test]
+    async fn enter_in_the_palette_completes_when_the_text_is_not_yet_a_command() {
+        let cell = crate::permissions::PermissionEngine::default().mode_cell();
+        let mut a = app();
+        type_line(&mut a, "/co").await;
+
+        let outcome =
+            handle_overlay_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut a, &cell)
+                .await;
+
+        assert_eq!(outcome, OverlayOutcome::Consumed, "/co is ambiguous, so Enter completes");
+        assert!(a.textarea.text().starts_with("/comp"), "got {:?}", a.textarea.text());
+    }
+
+    #[tokio::test]
+    async fn typing_a_non_command_closes_the_palette() {
+        let mut a = app();
+        type_line(&mut a, "/zzz").await;
+        assert!(matches!(a.overlay, Overlay::None), "nothing matches, so the palette is useless");
     }
 
     #[test]
