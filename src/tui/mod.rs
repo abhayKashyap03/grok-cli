@@ -135,13 +135,23 @@ pub struct App {
     pub todos: Vec<TodoItem>,
     pub session_id: String,
     pub context_tokens: u64,
+    /// Current git branch, for the status bar. `None` outside a repository.
+    pub branch: Option<String>,
+    /// Counts shown in the banner and status bar.
+    pub tool_count: usize,
+    pub mcp_count: usize,
+    pub subagent_count: usize,
     pub should_quit: bool,
     /// Set by a first Ctrl+C so a second one within the window exits.
     quit_armed_at: Option<Instant>,
 }
 
-/// Spinner frames. Braille dots animate smoothly in most terminal fonts.
-const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+/// Spinner frames.
+///
+/// ASCII rather than braille dots, which look better but are absent from Menlo
+/// and Monaco — the two fonts macOS Terminal ships with. A spinner that renders
+/// as a box on every frame is worse than a plain one that always works.
+pub(crate) const SPINNER: [&str; 4] = ["|", "/", "-", "\\"];
 /// How long a Ctrl+C stays "armed" before a second press stops meaning quit.
 const QUIT_WINDOW: Duration = Duration::from_secs(2);
 
@@ -169,6 +179,10 @@ impl App {
             todos: Vec::new(),
             session_id,
             context_tokens: 0,
+            branch: None,
+            tool_count: 0,
+            mcp_count: 0,
+            subagent_count: 0,
             should_quit: false,
             quit_armed_at: None,
         }
@@ -365,6 +379,10 @@ pub async fn run(mut agent: Agent, store: Option<SessionStore>) -> Result<()> {
     let mut app = App::new(config.clone(), agent.session.id.clone());
     app.model = agent.session.model.clone();
     app.mode = agent.permissions.mode();
+    app.branch = crate::util::git_branch(&config.workspace);
+    app.tool_count = agent.tools.iter().filter(|t| !t.name().starts_with("mcp__")).count();
+    app.mcp_count = agent.tools.iter().filter(|t| t.name().starts_with("mcp__")).count();
+    app.subagent_count = agent.subagents.len();
     replay_session(&mut app, &agent);
 
     if !agent.permissions.invalid.is_empty() {
@@ -516,11 +534,21 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) 
 
 /// Rebuild the transcript from a resumed session's messages.
 fn replay_session(app: &mut App, agent: &Agent) {
+    // Tool results are stored as separate `tool` messages keyed by call id.
+    // Index them first so each call can be shown with what it returned.
+    let results: std::collections::HashMap<&str, &str> = agent
+        .session
+        .messages
+        .iter()
+        .filter(|m| m.is_role(Role::Tool))
+        .filter_map(|m| Some((m.tool_call_id.as_deref()?, m.content.as_deref()?)))
+        .collect();
+
     for message in &agent.session.messages {
-        let Some(content) = message.content.as_deref().filter(|c| !c.trim().is_empty()) else {
-            continue;
-        };
         if message.is_role(Role::User) {
+            let Some(content) = message.content.as_deref().filter(|c| !c.trim().is_empty()) else {
+                continue;
+            };
             // Skip the compaction marker: it is machinery, not conversation.
             if content.starts_with("<summary-of-earlier-conversation>") {
                 app.notice("Resumed after an earlier compaction.", NoticeLevel::Info);
@@ -528,8 +556,68 @@ fn replay_session(app: &mut App, agent: &Agent) {
             }
             app.transcript.push(TranscriptItem::User(content.to_string()));
         } else if message.is_role(Role::Assistant) {
-            app.transcript
-                .push(TranscriptItem::Assistant { text: content.to_string(), done: true });
+            if let Some(content) = message.content.as_deref().filter(|c| !c.trim().is_empty()) {
+                app.transcript
+                    .push(TranscriptItem::Assistant { text: content.to_string(), done: true });
+            }
+
+            // Replay the tool calls too. Without this a resumed session shows
+            // only the prose, and the record of what was actually *done* — the
+            // files read, the edits applied, the commands run — silently
+            // disappears, which is most of what you resume a session to see.
+            for call in message.tool_calls.iter().flatten() {
+                let args = call.parsed_arguments().unwrap_or_default();
+                let summary = agent
+                    .tools
+                    .get(&call.function.name)
+                    .map_or_else(|| call.function.name.clone(), |t| t.summarize(&args));
+
+                let outcome = results.get(call.id.as_str()).copied().unwrap_or("");
+                // A tool's one-line summary is not stored — only the full text
+                // it returned to the model. Most tools lead with a summary
+                // line, but the file-reading ones lead with file *content*, and
+                // showing a random source line as if it were a summary is
+                // worse than showing the size.
+                let first = outcome.lines().next().unwrap_or("").trim();
+                let looks_like_file_content = first
+                    .trim_start()
+                    .starts_with(|c: char| c.is_ascii_digit())
+                    && first.contains(crate::util::LINE_NUMBER_SEPARATOR);
+                let detail = if looks_like_file_content {
+                    let lines = outcome.lines().filter(|l| l.contains(crate::util::LINE_NUMBER_SEPARATOR)).count();
+                    format!("{lines} line{}", if lines == 1 { "" } else { "s" })
+                } else {
+                    first.to_string()
+                };
+
+                // An edit's diff is not stored, but its arguments are — so it
+                // can be reconstructed. Without this, resuming shows that a
+                // file was edited but not what changed, which is the part
+                // worth looking at.
+                let mut display = ToolDisplay::default();
+                if call.function.name == "edit_file"
+                    && let (Some(old), Some(new)) = (
+                        args.get("old_string").and_then(serde_json::Value::as_str),
+                        args.get("new_string").and_then(serde_json::Value::as_str),
+                    )
+                {
+                    display.diff = crate::util::diff_lines(old, new, 1);
+                    display.diff_stats = Some(crate::util::diff_stats(old, new));
+                }
+
+                app.transcript.push(TranscriptItem::Tool {
+                    id: call.id.clone(),
+                    name: call.function.name.clone(),
+                    summary,
+                    state: ToolState::Finished {
+                        summary: (!detail.is_empty())
+                            .then(|| crate::util::truncate_text(&detail, 90)),
+                        display: Box::new(display),
+                        is_error: false,
+                        duration: Duration::ZERO,
+                    },
+                });
+            }
         }
     }
 
@@ -543,6 +631,10 @@ fn replay_session(app: &mut App, agent: &Agent) {
         .filter(|c| !c.starts_with("<summary-of-earlier-conversation>"))
         .collect();
     app.textarea.load_history(prompts);
+
+    // Seed the context meter from what was restored, so a resumed session does
+    // not read as empty until the next API call reports real usage.
+    app.context_tokens = agent.session.estimated_context_tokens();
 
     if !app.transcript.is_empty() {
         app.notice(
@@ -559,6 +651,9 @@ async fn sync_from_agent(app: &mut App, agent: &Arc<Mutex<Agent>>) {
     app.model = guard.session.model.clone();
     app.mode = guard.permissions.mode();
     app.session_id = guard.session.id.clone();
+    app.tool_count = guard.tools.iter().filter(|t| !t.name().starts_with("mcp__")).count();
+    app.mcp_count = guard.tools.iter().filter(|t| t.name().starts_with("mcp__")).count();
+    app.subagent_count = guard.subagents.len();
     if app.context_tokens == 0 {
         app.context_tokens = guard.session.estimated_context_tokens();
     }

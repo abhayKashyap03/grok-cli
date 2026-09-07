@@ -22,6 +22,14 @@ use super::{App, NoticeLevel, Overlay, ToolState, TranscriptItem, format_tokens}
 /// Diff lines shown under a tool result before it is elided.
 const MAX_DIFF_LINES: usize = 14;
 
+/// Marker before a tool's detail line.
+///
+/// Deliberately a box-drawing character rather than something prettier like
+/// `⏵`: that codepoint is absent from Menlo, the default macOS terminal font,
+/// so it rendered as a missing-glyph box on every tool line. Box-drawing is
+/// present in every monospace font that can draw the borders around it.
+const DETAIL_PREFIX: char = '└';
+
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let input_height = (app.textarea.visible_height() as u16 + 2).min(12);
     let chunks = Layout::default()
@@ -29,7 +37,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         .constraints([
             Constraint::Min(3),                 // transcript
             Constraint::Length(input_height),   // input
-            Constraint::Length(1),              // status bar
+            Constraint::Length(2),              // status bar
         ])
         .split(frame.area());
 
@@ -206,12 +214,12 @@ fn tool_lines(
     match state {
         ToolState::Running { started } => {
             lines.push(Line::from(Span::styled(
-                format!("  ⏵ running… {}", util::format_duration(started.elapsed())),
+                format!("  {DETAIL_PREFIX} running… {}", util::format_duration(started.elapsed())),
                 detail_style,
             )));
         }
         ToolState::Denied { reason } => {
-            lines.push(Line::from(Span::styled(format!("  ⏵ {reason}"), detail_style)));
+            lines.push(Line::from(Span::styled(format!("  {DETAIL_PREFIX} {reason}"), detail_style)));
         }
         ToolState::Finished { summary, display, is_error, duration } => {
             let mut detail = summary.clone().unwrap_or_else(|| {
@@ -223,7 +231,7 @@ fn tool_lines(
                 detail.push_str(&format!(" · {}", util::format_duration(*duration)));
             }
             let style = if *is_error { Style::default().fg(theme.error) } else { detail_style };
-            lines.push(Line::from(Span::styled(format!("  ⏵ {detail}"), style)));
+            lines.push(Line::from(Span::styled(format!("  {DETAIL_PREFIX} {detail}"), style)));
 
             for diff_line in display.diff.iter().take(MAX_DIFF_LINES) {
                 let (marker, colour) = match diff_line.kind {
@@ -253,17 +261,91 @@ fn welcome(app: &App) -> Vec<Line<'static>> {
     let theme = &app.theme;
     let accent = Style::default().fg(theme.accent).add_modifier(Modifier::BOLD);
     let dim = Style::default().fg(theme.dim);
+    let value = Style::default().fg(theme.text);
+    let label_w = 12;
+
+    // Key/value row, with an optional right-hand hint naming the command that
+    // changes it — the thing a new user most wants to know.
+    let row = |label: &str, val: Vec<Span<'static>>, hint: &str| {
+        let mut spans = vec![
+            Span::styled("   ", dim),
+            Span::styled(format!("{label:<label_w$}"), dim),
+        ];
+        spans.extend(val);
+        if !hint.is_empty() {
+            spans.push(Span::styled(format!("  {hint}"), dim));
+        }
+        Line::from(spans)
+    };
+
+    let window = crate::config::model_info(&app.model).context_window;
+    let home = dirs::home_dir().map(|h| h.display().to_string()).unwrap_or_default();
+    let cwd = {
+        let full = app.config.workspace.display().to_string();
+        match (!home.is_empty()).then(|| full.strip_prefix(&home)).flatten() {
+            Some(rest) => format!("~{rest}"),
+            None => full,
+        }
+    };
+
+    let mut tools = vec![Span::styled(format!("{} built-in", app.tool_count), value)];
+    if app.mcp_count > 0 {
+        tools.push(Span::styled(format!(" · {} from MCP", app.mcp_count), value));
+    }
+    if app.subagent_count > 0 {
+        tools.push(Span::styled(
+            format!(" · {} subagent{}", app.subagent_count, if app.subagent_count == 1 { "" } else { "s" }),
+            value,
+        ));
+    }
+
+    let mut location = vec![Span::styled(cwd, value)];
+    if let Some(branch) = &app.branch {
+        location.push(Span::styled("  ▸ ", Style::default().fg(theme.accent)));
+        location.push(Span::styled(branch.clone(), Style::default().fg(theme.accent)));
+    }
 
     vec![
         Line::default(),
-        Line::from(Span::styled(format!("  {} v{}", crate::APP_NAME, crate::VERSION), accent)),
+        Line::from(vec![
+            Span::styled("  ▄▀▄  ", accent),
+            Span::styled(format!("{} ", crate::APP_NAME), accent),
+            Span::styled(format!("v{}", crate::VERSION), dim),
+        ]),
+        Line::from(vec![
+            Span::styled("  ▀▄▀  ", accent),
+            Span::styled("an agentic coding harness for xAI's Grok models", dim),
+        ]),
         Line::default(),
-        Line::from(Span::styled(format!("  {}", app.config.workspace.display()), dim)),
-        Line::from(Span::styled(format!("  {}", app.model), dim)),
+        row("model", vec![
+            Span::styled(app.model.clone(), value),
+            Span::styled(format!("  {} context", format_tokens(window)), dim),
+        ], "/model"),
+        row("directory", location, ""),
+        row("permissions", vec![
+            Span::styled(app.mode.as_str().to_string(), Style::default().fg(mode_colour(theme, app.mode))),
+            Span::styled(format!(" — {}", app.mode.describe()), dim),
+        ], "shift+tab"),
+        row("tools", tools, "/tools"),
         Line::default(),
-        Line::from(Span::styled("  Ask for a change and it will make it.", dim)),
-        Line::from(Span::styled("  /help for commands · Shift+Tab to change mode · Ctrl+C twice to exit", dim)),
+        Line::from(vec![
+            Span::styled("   Ask for a change and it will make it. ", dim),
+            Span::styled("/help", Style::default().fg(theme.accent)),
+            Span::styled(" for commands · ", dim),
+            Span::styled("Ctrl+C", Style::default().fg(theme.accent)),
+            Span::styled(" twice to exit", dim),
+        ]),
     ]
+}
+
+/// Colour for a permission mode, shared by the banner, input border and status.
+fn mode_colour(theme: &Theme, mode: PermissionMode) -> ratatui::style::Color {
+    match mode {
+        PermissionMode::Plan => theme.accent,
+        PermissionMode::BypassPermissions => theme.error,
+        PermissionMode::AcceptEdits => theme.success,
+        PermissionMode::Default => theme.success,
+    }
 }
 
 fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
@@ -313,57 +395,127 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
 fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     let theme = &app.theme;
     let dim = Style::default().fg(theme.dim);
-    let mut spans = Vec::new();
+    let width = area.width as usize;
 
-    let mode_colour = match app.mode {
-        PermissionMode::Plan => theme.accent,
-        PermissionMode::BypassPermissions => theme.error,
-        PermissionMode::AcceptEdits => theme.success,
-        PermissionMode::Default => theme.dim,
-    };
-    spans.push(Span::styled(format!(" {} ", app.mode.as_str()), Style::default().fg(mode_colour)));
-    spans.push(Span::styled("· ", dim));
-    spans.push(Span::styled(format!("{} ", app.model), dim));
+    // -- row one: what the agent is, and where -----------------------------
+    let mode_style = Style::default().fg(mode_colour(theme, app.mode)).add_modifier(Modifier::BOLD);
+    let mut left = vec![
+        Span::styled(" ◆ ", mode_style),
+        Span::styled(app.mode.as_str().to_string(), mode_style),
+        Span::styled("  ", dim),
+        Span::styled(short_path(&app.config.workspace), Style::default().fg(theme.text)),
+    ];
+    if let Some(branch) = &app.branch {
+        left.push(Span::styled("  ▸ ", dim));
+        left.push(Span::styled(branch.clone(), Style::default().fg(theme.accent)));
+    }
 
+    // Right side: the context meter, which is the number people actually watch.
     let window = crate::config::model_info(&app.model).context_window;
-    if app.context_tokens > 0 {
-        let pct = (app.context_tokens as f64 / window as f64 * 100.0).min(999.0);
-        // Warn before compaction hits, so a surprise summary is never the first
-        // sign that the window filled up.
-        let colour = if pct > 85.0 {
-            theme.warning
-        } else if pct > 95.0 {
-            theme.error
-        } else {
-            theme.dim
-        };
-        spans.push(Span::styled("· ", dim));
-        spans.push(Span::styled(
-            format!("{} ({pct:.0}%) ", format_tokens(app.context_tokens)),
-            Style::default().fg(colour),
+    let pct = if window == 0 { 0.0 } else { app.context_tokens as f64 / window as f64 * 100.0 };
+    let meter_colour = if pct > 90.0 {
+        theme.error
+    } else if pct > 75.0 {
+        theme.warning
+    } else {
+        theme.success
+    };
+    let right = vec![
+        Span::styled(meter(pct), Style::default().fg(meter_colour)),
+        Span::styled(
+            format!(" {} / {} ", format_tokens(app.context_tokens), format_tokens(window)),
+            Style::default().fg(theme.text),
+        ),
+        Span::styled(format!("({pct:.0}%) "), dim),
+    ];
+    frame.render_widget(
+        Paragraph::new(justify(left, right, width)),
+        Rect { height: 1, ..area },
+    );
+
+    // -- row two: capabilities and cost ------------------------------------
+    let mut left2 = vec![
+        Span::styled(" ", dim),
+        Span::styled(app.model.clone(), Style::default().fg(theme.tool)),
+        Span::styled(format!("  ·  {} tools", app.tool_count), dim),
+    ];
+    if app.mcp_count > 0 {
+        left2.push(Span::styled(format!("  ·  {} MCP", app.mcp_count), dim));
+    }
+    if app.subagent_count > 0 {
+        left2.push(Span::styled(
+            format!(
+                "  ·  {} agent{}",
+                app.subagent_count,
+                if app.subagent_count == 1 { "" } else { "s" }
+            ),
+            dim,
         ));
     }
 
-    if app.usage.total_tokens > 0 {
-        spans.push(Span::styled("· ", dim));
-        spans.push(Span::styled(format!("{} used ", format_tokens(app.usage.total_tokens)), dim));
-    }
-
+    let mut right2 = Vec::new();
     let pending = app.todos.iter().filter(|t| t.status != TodoStatus::Completed).count();
     if pending > 0 {
-        spans.push(Span::styled("· ", dim));
-        spans.push(Span::styled(
-            format!("{pending} task{} left ", if pending == 1 { "" } else { "s" }),
+        right2.push(Span::styled(
+            format!("☐ {pending} left  ·  "),
             Style::default().fg(theme.accent),
         ));
     }
-
-    if !app.status.is_empty() {
-        spans.push(Span::styled("· ", dim));
-        spans.push(Span::styled(app.status.clone(), Style::default().fg(theme.warning)));
+    if app.usage.total_tokens > 0 {
+        right2.push(Span::styled(format!("{} used  ·  ", format_tokens(app.usage.total_tokens)), dim));
+    }
+    if app.busy {
+        right2.push(Span::styled(
+            format!("{} working ", app.spinner()),
+            Style::default().fg(theme.warning),
+        ));
+    } else if !app.status.is_empty() {
+        right2.push(Span::styled(format!("{} ", app.status), Style::default().fg(theme.warning)));
+    } else {
+        right2.push(Span::styled("? /help ", dim));
     }
 
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    if area.height > 1 {
+        frame.render_widget(
+            Paragraph::new(justify(left2, right2, width)),
+            Rect { y: area.y + 1, height: 1, ..area },
+        );
+    }
+}
+
+/// An eight-cell bar for context usage.
+fn meter(pct: f64) -> String {
+    const CELLS: usize = 8;
+    let filled = ((pct / 100.0) * CELLS as f64).round().clamp(0.0, CELLS as f64) as usize;
+    // Show one filled cell as soon as anything is used, so the meter never
+    // reads as empty during a conversation that has clearly started.
+    let filled = if pct > 0.0 { filled.max(1) } else { 0 };
+    format!("{}{}", "▮".repeat(filled), "▯".repeat(CELLS - filled))
+}
+
+/// Push `right` against the right edge, padding between the two groups.
+fn justify(left: Vec<Span<'static>>, right: Vec<Span<'static>>, width: usize) -> Line<'static> {
+    let used: usize = left
+        .iter()
+        .chain(right.iter())
+        .map(|s| unicode_width::UnicodeWidthStr::width(s.content.as_ref()))
+        .sum();
+    let mut spans = left;
+    spans.push(Span::raw(" ".repeat(width.saturating_sub(used))));
+    spans.extend(right);
+    Line::from(spans)
+}
+
+/// `~`-abbreviated workspace path.
+fn short_path(path: &std::path::Path) -> String {
+    let full = path.display().to_string();
+    match dirs::home_dir() {
+        Some(home) => match full.strip_prefix(&home.display().to_string()) {
+            Some(rest) => format!("~{rest}"),
+            None => full,
+        },
+        None => full,
+    }
 }
 
 /// A centred box `pct_x` by `pct_y` percent of the screen.
@@ -629,6 +781,51 @@ mod tests {
     }
 
     #[test]
+    fn counts_in_the_status_bar_are_pluralised_correctly() {
+        let mut a = app();
+        a.tool_count = 12;
+        a.subagent_count = 1;
+        let out = screen(&mut a, 118, 14);
+        assert!(out.contains("1 agent"), "got:\n{out}");
+        assert!(!out.contains("1 agents"), "singular must not read as plural:\n{out}");
+
+        a.subagent_count = 3;
+        let out = screen(&mut a, 118, 14);
+        assert!(out.contains("3 agents"), "got:\n{out}");
+    }
+
+    #[test]
+    fn the_context_window_is_shown_in_human_units() {
+        let mut a = app();
+        let out = screen(&mut a, 118, 14);
+        assert!(out.contains("2.0M"), "a 2M window must not render as 2000k:\n{out}");
+    }
+
+    #[test]
+    fn the_banner_shows_what_a_new_user_needs() {
+        let mut a = app();
+        a.branch = Some("main".into());
+        a.tool_count = 12;
+        a.subagent_count = 2;
+        a.mcp_count = 3;
+        let out = screen(&mut a, 118, 20);
+
+        for expected in ["grok-cli", "model", "directory", "permissions", "tools", "main",
+                         "3 from MCP", "2 subagents", "/help"] {
+            assert!(out.contains(expected), "banner omits {expected:?}:\n{out}");
+        }
+    }
+
+    #[test]
+    fn the_context_meter_fills_as_the_window_fills() {
+        assert_eq!(meter(0.0), "▯▯▯▯▯▯▯▯");
+        assert_eq!(meter(100.0), "▮▮▮▮▮▮▮▮");
+        assert_eq!(meter(50.0), "▮▮▮▮▯▯▯▯");
+        // Any usage at all must show, or a busy session reads as empty.
+        assert_eq!(meter(0.1), "▮▯▯▯▯▯▯▯");
+    }
+
+    #[test]
     fn the_status_bar_shows_mode_model_and_context() {
         let mut a = app();
         a.mode = PermissionMode::Plan;
@@ -697,6 +894,47 @@ mod tests {
         let out = screen(&mut a, 90, 24);
         assert!(out.contains("/compact"), "got:\n{out}");
         assert!(out.contains("/cost"), "got:\n{out}");
+    }
+
+    #[test]
+    fn every_glyph_the_ui_draws_exists_in_a_default_terminal_font() {
+        // Menlo is the default macOS terminal font. `⏵` and the braille
+        // spinner were absent from it, so every tool line and every "thinking"
+        // frame rendered as a missing-glyph box. Codepoints added here must be
+        // checked against a real font before use.
+        //
+        // Menlo's repertoire covers Latin-1, General Punctuation, Arrows,
+        // Box Drawing, Block Elements, Geometric Shapes and Dingbats — but not
+        // Miscellaneous Technical (U+2300–23FF) or Braille (U+2800–28FF).
+        let forbidden = |c: char| {
+            let u = c as u32;
+            (0x2300..=0x23FF).contains(&u) || (0x2800..=0x28FF).contains(&u)
+        };
+
+        assert!(!forbidden(DETAIL_PREFIX), "tool detail prefix is not renderable");
+        for frame in crate::tui::SPINNER {
+            for c in frame.chars() {
+                assert!(!forbidden(c), "spinner frame {frame:?} is not renderable");
+            }
+        }
+
+        // And the same for whatever the renderer actually emits for a full
+        // session, which catches a glyph added anywhere in this file.
+        let mut a = app();
+        a.transcript.push(TranscriptItem::Tool {
+            id: "t".into(),
+            name: "bash".into(),
+            summary: "Bash(cargo test)".into(),
+            state: ToolState::Finished {
+                summary: Some("exit 0".into()),
+                display: Box::default(),
+                is_error: false,
+                duration: std::time::Duration::from_millis(10),
+            },
+        });
+        for c in screen(&mut a, 90, 20).chars() {
+            assert!(!forbidden(c), "renderer emitted unrenderable glyph {c:?} (U+{:04X})", c as u32);
+        }
     }
 
     #[test]

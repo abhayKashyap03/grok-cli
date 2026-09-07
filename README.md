@@ -5,27 +5,8 @@ runs your tests, and iterates — in a terminal, with permission controls you se
 
 Written in Rust. Single binary, no runtime.
 
-```
-┌─ conversation ───────────────────────────────────┐
-│ › the token check rejects tokens at expiry, fix  │
-│                                                  │
-│ ● Read(src/auth.rs)                              │
-│   ⏵ 142 lines                                    │
-│                                                  │
-│ ● Edit(src/auth.rs)                              │
-│   ⏵ +1 -1                                        │
-│     -    now < expiry                            │
-│     +    now <= expiry                           │
-│                                                  │
-│ Fixed. src/auth.rs:42 used a strict comparison,  │
-│ so a token was invalid at the exact expiry       │
-│ instant.                                         │
-└──────────────────────────────────────────────────┘
-┌─ Message ────────────────────────────────────────┐
-│ ▌                                                │
-└──────────────────────────────────────────────────┘
- default · grok-4-1-fast-non-reasoning · 7.3k (0%)
-```
+![grok-cli fixing an off-by-one in a real repo](images/session.png)
+
 
 ## Install
 
@@ -57,6 +38,8 @@ echo "review this diff" | grok -p -     # read the prompt from stdin
 grok -c                                 # continue the last session
 grok --resume a1b2c3                    # resume a specific one
 ```
+
+![the welcome screen](images/welcome.png)
 
 ### Interactive keys
 

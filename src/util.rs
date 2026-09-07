@@ -109,6 +109,22 @@ pub fn normalize(path: &Path) -> PathBuf {
     out
 }
 
+/// Current git branch, read straight from `.git/HEAD`.
+///
+/// Deliberately not a `git` subprocess: this runs on every frame of the status
+/// bar, and spawning a process 11 times a second to render one word is absurd.
+/// A detached HEAD yields the short commit id instead.
+pub fn git_branch(workspace: &Path) -> Option<String> {
+    let head = std::fs::read_to_string(workspace.join(".git/HEAD")).ok()?;
+    let head = head.trim();
+    match head.strip_prefix("ref: refs/heads/") {
+        Some(branch) => Some(branch.to_string()),
+        // Detached: HEAD holds a raw sha.
+        None if head.len() >= 7 => Some(head[..7].to_string()),
+        None => None,
+    }
+}
+
 /// True if `path` is inside `root`. Both should already be normalized.
 pub fn is_within(root: &Path, path: &Path) -> bool {
     path.starts_with(root)
@@ -305,6 +321,20 @@ mod tests {
     fn identical_text_produces_no_diff() {
         assert!(diff_lines("same\n", "same\n", 3).is_empty());
         assert_eq!(diff_stats("same\n", "same\n"), (0, 0));
+    }
+
+    #[test]
+    fn the_branch_is_read_from_the_git_head_file() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(git_branch(dir.path()), None, "a non-repo has no branch");
+
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        std::fs::write(dir.path().join(".git/HEAD"), "ref: refs/heads/feature/x\n").unwrap();
+        assert_eq!(git_branch(dir.path()).as_deref(), Some("feature/x"));
+
+        // Detached HEAD shows the short sha rather than nothing.
+        std::fs::write(dir.path().join(".git/HEAD"), "a1b2c3d4e5f6\n").unwrap();
+        assert_eq!(git_branch(dir.path()).as_deref(), Some("a1b2c3d"));
     }
 
     #[test]
