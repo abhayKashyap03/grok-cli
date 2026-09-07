@@ -387,8 +387,19 @@ pub async fn run(mut agent: Agent, store: Option<SessionStore>) -> Result<()> {
     let mut cancel = CancellationToken::new();
 
     let result = loop {
-        terminal.draw(|frame| render::draw(frame, &mut app))?;
-        app.clamp_scroll();
+        // A terminal can report a degenerate size — transiently while being
+        // resized, and persistently under some multiplexers. Drawing into it
+        // emits a stream of control sequences and nothing else, so skip the
+        // frame rather than spinning. Events are still processed, so the
+        // session recovers the moment a real size arrives.
+        let drawable = terminal
+            .size()
+            .map(|size| size.width >= 4 && size.height >= 4)
+            .unwrap_or(false);
+        if drawable {
+            terminal.draw(|frame| render::draw(frame, &mut app))?;
+            app.clamp_scroll();
+        }
 
         if app.should_quit {
             break Ok(());

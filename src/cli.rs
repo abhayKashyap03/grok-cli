@@ -162,6 +162,18 @@ pub async fn main() -> Result<()> {
             crate::headless::run(&mut agent, &prompt, &failures).await
         }
         None => {
+            // Without a terminal, raw mode fails with a bare "Device not
+            // configured", which tells the user nothing. Catch it here, where
+            // the actionable alternative is known.
+            use std::io::IsTerminal;
+            if !std::io::stdout().is_terminal() || !std::io::stdin().is_terminal() {
+                bail!(
+                    "the interactive interface needs a terminal.\n\n\
+                     For scripts and pipelines use non-interactive mode instead:\n\
+                     \x20   grok -p \"your prompt\"\n\
+                     \x20   echo \"your prompt\" | grok -p -"
+                );
+            }
             for (name, error) in &failures {
                 tracing::warn!(server = %name, %error, "MCP server unavailable");
             }
