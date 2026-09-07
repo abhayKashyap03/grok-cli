@@ -19,6 +19,9 @@
 
 pub mod api;
 pub mod config;
+pub mod hooks;
+pub mod permissions;
+pub mod session;
 pub mod tools;
 pub mod util;
 
