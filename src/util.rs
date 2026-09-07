@@ -147,14 +147,23 @@ pub fn looks_binary(bytes: &[u8]) -> bool {
     bytes.iter().take(8192).any(|&b| b == 0)
 }
 
-/// Number lines in `cat -n` style, starting at `start`.
+/// Separator between a display line number and the line's content.
+///
+/// Deliberately not a tab. Observed against a live model: with `<number><tab>`
+/// the model repeatedly mistook the separator for the file's own indentation,
+/// pasted a phantom tab into `edit_file`, failed, and eventually clobbered the
+/// file with `write_file`. `│` cannot occur at the start of a line of source
+/// code, so it cannot be mistaken for content.
+pub const LINE_NUMBER_SEPARATOR: char = '│';
+
+/// Number lines for display, starting at `start`.
 ///
 /// Line numbers matter: they let the model reference exact locations, and they
 /// let the read and edit tools agree on what "line 42" means.
 pub fn number_lines(text: &str, start: usize) -> String {
     let mut out = String::with_capacity(text.len() + text.lines().count() * 8);
     for (i, line) in text.lines().enumerate() {
-        out.push_str(&format!("{:>6}\t{}\n", start + i, line));
+        out.push_str(&format!("{:>6}{LINE_NUMBER_SEPARATOR}{line}\n", start + i));
     }
     out
 }
@@ -269,7 +278,15 @@ mod tests {
 
     #[test]
     fn line_numbering_starts_where_it_is_told() {
-        assert_eq!(number_lines("a\nb", 10), "    10\ta\n    11\tb\n");
+        assert_eq!(number_lines("a\nb", 10), "    10│a\n    11│b\n");
+    }
+
+    #[test]
+    fn the_line_number_separator_cannot_be_confused_with_indentation() {
+        // A tab here was mistaken by a live model for the file's own
+        // indentation, which corrupted every subsequent edit.
+        assert_ne!(LINE_NUMBER_SEPARATOR, '\t');
+        assert!(!LINE_NUMBER_SEPARATOR.is_whitespace());
     }
 
     #[test]

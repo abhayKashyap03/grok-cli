@@ -296,7 +296,14 @@ impl Agent {
             self.session.push(completion.message.clone());
 
             let Some(calls) = completion.message.tool_calls.clone().filter(|c| !c.is_empty()) else {
-                return StopReason::Complete;
+                // A stream cancelled part-way still returns the text it had, so
+                // the check has to happen here too. Reporting Complete for a
+                // turn the user interrupted is a lie the UI then repeats.
+                return if self.tool_context.cancel.is_cancelled() {
+                    StopReason::Interrupted
+                } else {
+                    StopReason::Complete
+                };
             };
 
             // Invariant: every call is answered, even after an interrupt.

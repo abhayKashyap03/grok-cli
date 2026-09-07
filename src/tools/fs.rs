@@ -89,7 +89,7 @@ impl Tool for ReadFile {
         p.insert("limit".into(), prop("integer", "Maximum number of lines to return."));
         ToolSpec::function(
             "read_file",
-            "Read a text file and return its contents with line numbers. Always read a file before editing it.",
+            "Read a text file. Always read a file before editing it. Each line is prefixed with `<line number>│` for reference only — that prefix is NOT part of the file, so never include it in `edit_file`'s old_string. Everything after the `│` is the file's exact content, including its indentation.",
             object_schema(p, &["path"]),
         )
     }
@@ -274,7 +274,7 @@ impl Tool for EditFile {
         );
         ToolSpec::function(
             "edit_file",
-            "Replace exact text in a file. The file must have been read first. `old_string` must match the file byte for byte, including leading whitespace.",
+            "Replace exact text in a file. The file must have been read first. `old_string` must match the file byte for byte, including its leading whitespace — but WITHOUT the `<line number>│` prefixes that read_file adds for display.",
             object_schema(p, &["path", "old_string", "new_string"]),
         )
     }
@@ -316,11 +316,38 @@ impl Tool for EditFile {
             Err(e) => return Ok(ToolOutcome::error(format!("cannot read {}: {e}", path.display()))),
         };
 
-        let matches = content.matches(&old).count();
+        // Recovery ladder. Each rung handles a way models get `old_string`
+        // slightly wrong while their *intent* stays unambiguous. Being strict
+        // here does not make edits safer — it just costs round trips and pushes
+        // the model toward `write_file`, which is far more destructive.
+        let mut old = old;
+        let mut recovery: Option<&str> = None;
+
+        // 1. The display prefix from read_file was pasted back in.
+        if !content.contains(&old)
+            && let Some(stripped) = strip_line_number_prefixes(&old)
+            && content.contains(&stripped)
+        {
+            old = stripped;
+            recovery = Some("line-number prefixes were stripped from old_string");
+        }
+
+        // 2. The indentation was reconstructed and got it wrong.
+        let mut indentation_range = None;
+        if !content.contains(&old) {
+            let candidate = strip_line_number_prefixes(&old).unwrap_or_else(|| old.clone());
+            if let Some(range) = find_ignoring_indentation(&content, &candidate) {
+                indentation_range = Some(range);
+                recovery = Some("old_string matched apart from leading whitespace");
+            }
+        }
+
+        let matches = if indentation_range.is_some() { 1 } else { content.matches(&old).count() };
         if matches == 0 {
             return Ok(ToolOutcome::error(format!(
-                "old_string not found in {}. It must match the file exactly, including indentation and line breaks.",
-                path.display()
+                "old_string not found in {}. It must match the file exactly, including indentation and line breaks, and must not include the `<line number>{}` prefixes that read_file adds for display.",
+                path.display(),
+                util::LINE_NUMBER_SEPARATOR
             )));
         }
         // Ambiguity is an error, not a coin flip: replacing the wrong one of
@@ -332,8 +359,23 @@ impl Tool for EditFile {
             )));
         }
 
-        let updated =
-            if replace_all { content.replace(&old, &new) } else { content.replacen(&old, &new, 1) };
+        let updated = match indentation_range {
+            // Re-indent the replacement to match what the file actually had, so
+            // recovering from bad whitespace does not introduce bad whitespace.
+            Some(range) => {
+                let actual = &content[range.clone()];
+                let indent: String = actual
+                    .chars()
+                    .take_while(|c| *c == ' ' || *c == '\t')
+                    .collect();
+                let reindented = reindent(&new, &indent);
+                let mut updated = content.clone();
+                updated.replace_range(range, &reindented);
+                updated
+            }
+            None if replace_all => content.replace(&old, &new),
+            None => content.replacen(&old, &new, 1),
+        };
 
         if let Err(e) = tokio::fs::write(&path, &updated).await {
             return Ok(ToolOutcome::error(format!("cannot write {}: {e}", path.display())));
@@ -342,8 +384,11 @@ impl Tool for EditFile {
 
         let (added, removed) = util::diff_stats(&content, &updated);
         let shown = util::display_path(&ctx.workspace, &path);
+        let note = recovery
+            .map(|r| format!(" ({r}; match the file exactly next time)"))
+            .unwrap_or_default();
         Ok(ToolOutcome::ok(format!(
-            "Edited {shown}: {matches} replacement{} (+{added} -{removed})",
+            "Edited {shown}: {matches} replacement{} (+{added} -{removed}){note}",
             if matches == 1 { "" } else { "s" }
         ))
         .with_display(ToolDisplay {
@@ -641,6 +686,115 @@ impl Tool for Grep {
     }
 }
 
+/// Strip a leading `<spaces><digits><separator>` from every line, if every line
+/// has one.
+///
+/// Returns `None` when the text is not uniformly prefixed, so ordinary code
+/// that merely happens to start with a number is never mangled. Requiring
+/// *every* line to match is what makes this safe: a single stray match cannot
+/// silently rewrite the model's intent.
+fn strip_line_number_prefixes(text: &str) -> Option<String> {
+    let lines: Vec<&str> = text.split('\n').collect();
+    let mut out = Vec::with_capacity(lines.len());
+
+    for (i, line) in lines.iter().enumerate() {
+        // Tolerate a trailing blank line from a copied block.
+        if line.is_empty() && i == lines.len() - 1 {
+            out.push(String::new());
+            continue;
+        }
+        let trimmed = line.trim_start_matches(' ');
+        let digits: String = trimmed.chars().take_while(char::is_ascii_digit).collect();
+        if digits.is_empty() {
+            return None;
+        }
+        let rest = &trimmed[digits.len()..];
+        let stripped = rest
+            .strip_prefix(util::LINE_NUMBER_SEPARATOR)
+            // Accept a tab too: models trained on `cat -n` output emit it, and
+            // rejecting it would just cost another failed round trip.
+            .or_else(|| rest.strip_prefix('\t'))?;
+        out.push(stripped.to_string());
+    }
+    Some(out.join("\n"))
+}
+
+/// Re-indent `text` so its first line carries `indent`, shifting the rest by
+/// the same amount relative to their own original indentation.
+///
+/// Used when recovering from a whitespace-mismatched edit: the replacement was
+/// written against the model's idea of the indentation, so it has to be moved
+/// onto the file's real indentation or the fix introduces the very problem it
+/// was recovering from.
+fn reindent(text: &str, indent: &str) -> String {
+    let lines: Vec<&str> = text.split('\n').collect();
+    let Some(first) = lines.first() else { return text.to_string() };
+    let original: String = first.chars().take_while(|c| *c == ' ' || *c == '\t').collect();
+
+    lines
+        .iter()
+        .map(|line| {
+            if line.trim().is_empty() {
+                return (*line).to_string();
+            }
+            // Replace the model's leading whitespace with the file's, keeping
+            // any deeper nesting the line had relative to the first.
+            match line.strip_prefix(original.as_str()) {
+                Some(rest) => format!("{indent}{rest}"),
+                None => (*line).to_string(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Locate `needle` in `haystack` ignoring each line's leading whitespace.
+///
+/// Returns the byte range of the *actual* text in `haystack`, so the caller
+/// replaces real file content rather than the model's approximation of it.
+///
+/// This exists because models reconstruct indentation from memory and get it
+/// wrong — inventing a tab, or normalizing four spaces to two. The change they
+/// intend is unambiguous; only the whitespace is wrong. A match is accepted
+/// only when it is **unique**, so this can never silently pick the wrong one of
+/// several similar blocks.
+fn find_ignoring_indentation(haystack: &str, needle: &str) -> Option<std::ops::Range<usize>> {
+    let needle_lines: Vec<&str> = needle.split('\n').collect();
+    if needle_lines.iter().all(|l| l.trim().is_empty()) {
+        return None;
+    }
+
+    // Byte offset and trimmed content of every line in the haystack.
+    let mut offsets = Vec::new();
+    let mut cursor = 0usize;
+    for line in haystack.split('\n') {
+        offsets.push((cursor, line));
+        cursor += line.len() + 1; // +1 for the '\n'
+    }
+
+    let trimmed_needle: Vec<&str> = needle_lines.iter().map(|l| l.trim()).collect();
+    let window = trimmed_needle.len();
+    if window == 0 || window > offsets.len() {
+        return None;
+    }
+
+    let mut found: Option<std::ops::Range<usize>> = None;
+    for start in 0..=(offsets.len() - window) {
+        let matches = (0..window).all(|k| offsets[start + k].1.trim() == trimmed_needle[k]);
+        if !matches {
+            continue;
+        }
+        // Ambiguity means give up rather than guess.
+        if found.is_some() {
+            return None;
+        }
+        let from = offsets[start].0;
+        let last = &offsets[start + window - 1];
+        found = Some(from..last.0 + last.1.len());
+    }
+    found
+}
+
 /// Blocking search worker. Returns `(rendered output, match count, file count)`.
 fn search(
     root: &Path,
@@ -733,7 +887,7 @@ mod tests {
 
         let out = ReadFile.run(json!({"path": "a.rs"}), &ctx).await.unwrap();
         assert!(!out.is_error);
-        assert!(out.content.contains("     1\tfn main() {}"), "got: {}", out.content);
+        assert!(out.content.contains("     1\u{2502}fn main() {}"), "got: {}", out.content);
         assert_eq!(out.display.summary.as_deref(), Some("2 lines"));
         assert!(
             ctx.staleness_error(&dir.path().join("a.rs")).await.is_none(),
@@ -751,8 +905,8 @@ mod tests {
             .run(json!({"path": "a.txt", "offset": 3, "limit": 2}), &ctx_at(dir.path()))
             .await
             .unwrap();
-        assert!(out.content.contains("     3\tline3"));
-        assert!(out.content.contains("     4\tline4"));
+        assert!(out.content.contains("     3\u{2502}line3"));
+        assert!(out.content.contains("     4\u{2502}line4"));
         assert!(!out.content.contains("line5"));
         assert!(out.content.contains("offset=5"), "must tell the model how to continue");
     }
@@ -830,6 +984,142 @@ mod tests {
             .unwrap();
         assert!(!out.is_error, "got: {}", out.content);
         assert_eq!(std::fs::read_to_string(dir.path().join("a.rs")).unwrap(), "y\ny\n");
+    }
+
+    #[tokio::test]
+    async fn an_edit_pasted_back_with_line_numbers_still_applies() {
+        // Observed against the live model: it copied read_file's display prefix
+        // into old_string, failed five times, then clobbered the file with
+        // write_file. Recovering here costs nothing and saves the round trips.
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn f() {\n    now < expiry\n}\n").unwrap();
+        let ctx = ctx_at(dir.path());
+        ReadFile.run(json!({"path": "a.rs"}), &ctx).await.unwrap();
+
+        let out = EditFile
+            .run(
+                json!({
+                    "path": "a.rs",
+                    "old_string": "     2\t    now < expiry",
+                    "new_string": "    now <= expiry"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        assert!(!out.is_error, "got: {}", out.content);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.rs")).unwrap(),
+            "fn f() {\n    now <= expiry\n}\n",
+            "the file must not gain a stray tab"
+        );
+        assert!(out.content.contains("match the file exactly"), "the model is told: {}", out.content);
+    }
+
+    #[tokio::test]
+    async fn an_edit_with_hallucinated_indentation_still_applies_correctly() {
+        // Observed live: the model decided the file was tab-indented when it was
+        // space-indented, and every exact-match edit failed.
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn f() {\n    now < expiry\n}\n").unwrap();
+        let ctx = ctx_at(dir.path());
+        ReadFile.run(json!({"path": "a.rs"}), &ctx).await.unwrap();
+
+        let out = EditFile
+            .run(
+                json!({
+                    "path": "a.rs",
+                    "old_string": "\tnow < expiry",
+                    "new_string": "\tnow <= expiry"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        assert!(!out.is_error, "got: {}", out.content);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.rs")).unwrap(),
+            "fn f() {\n    now <= expiry\n}\n",
+            "the file keeps its real indentation; no phantom tab is introduced"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_whitespace_recovery_is_refused_when_it_would_be_ambiguous() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "  x = 1\n    x = 1\n").unwrap();
+        let ctx = ctx_at(dir.path());
+        ReadFile.run(json!({"path": "a.rs"}), &ctx).await.unwrap();
+
+        let out = EditFile
+            .run(json!({"path": "a.rs", "old_string": "\tx = 1", "new_string": "\tx = 2"}), &ctx)
+            .await
+            .unwrap();
+
+        assert!(out.is_error, "two equally good candidates must not be guessed between");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.rs")).unwrap(),
+            "  x = 1\n    x = 1\n",
+            "the file is untouched"
+        );
+    }
+
+    #[test]
+    fn prefix_stripping_only_fires_when_every_line_is_numbered() {
+        assert_eq!(
+            strip_line_number_prefixes("     1│fn f() {\n     2│    x\n").as_deref(),
+            Some("fn f() {\n    x\n")
+        );
+        // A tab separator is accepted too, for models trained on `cat -n`.
+        assert_eq!(strip_line_number_prefixes("  1\tone").as_deref(), Some("one"));
+        // Ordinary code that merely starts with a digit must be left alone.
+        assert!(strip_line_number_prefixes("42\nlet x = 1;").is_none());
+        assert!(strip_line_number_prefixes("     1│numbered\nnot numbered").is_none());
+        assert!(strip_line_number_prefixes("no numbers here").is_none());
+    }
+
+    #[test]
+    fn indentation_insensitive_search_requires_a_unique_match() {
+        let file = "fn a() {\n    work()\n}\nfn b() {\n    other()\n}\n";
+        let range = find_ignoring_indentation(file, "\twork()").expect("unique match");
+        assert_eq!(&file[range], "    work()");
+
+        // Two candidates: refuse rather than pick.
+        let ambiguous = "  same\n    same\n";
+        assert!(find_ignoring_indentation(ambiguous, "same").is_none());
+
+        // No candidate at all.
+        assert!(find_ignoring_indentation(file, "missing()").is_none());
+        // Blank needles never match.
+        assert!(find_ignoring_indentation(file, "   \n  ").is_none());
+    }
+
+    #[test]
+    fn reindenting_moves_a_block_onto_the_files_real_indentation() {
+        assert_eq!(reindent("\tone\n\t\ttwo", "    "), "    one\n    \ttwo");
+        assert_eq!(reindent("no indent", "  "), "  no indent");
+        // Blank lines stay blank rather than gaining trailing whitespace.
+        assert_eq!(reindent("\ta\n\n\tb", "  "), "  a\n\n  b");
+    }
+
+    #[tokio::test]
+    async fn code_that_looks_numbered_is_not_mangled() {
+        let dir = tempdir().unwrap();
+        // A real tab-indented file whose content could be mistaken for a prefix.
+        std::fs::write(dir.path().join("a.txt"), "1\tone\n2\ttwo\n").unwrap();
+        let ctx = ctx_at(dir.path());
+        ReadFile.run(json!({"path": "a.txt"}), &ctx).await.unwrap();
+
+        // An exact match must win before any stripping is attempted.
+        let out = EditFile
+            .run(json!({"path": "a.txt", "old_string": "1\tone", "new_string": "1\tONE"}), &ctx)
+            .await
+            .unwrap();
+        assert!(!out.is_error, "got: {}", out.content);
+        assert_eq!(std::fs::read_to_string(dir.path().join("a.txt")).unwrap(), "1\tONE\n2\ttwo\n");
+        assert!(!out.content.contains("omit them"), "no recovery should have been needed");
     }
 
     #[tokio::test]
