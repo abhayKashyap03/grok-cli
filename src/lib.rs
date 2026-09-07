@@ -17,9 +17,11 @@
 //! API. They meet at [`agent::AgentEvent`], a stream of facts about what the
 //! agent is doing, which the TUI renders and the headless runner prints.
 
+pub mod agent;
 pub mod api;
 pub mod config;
 pub mod hooks;
+pub mod mcp;
 pub mod permissions;
 pub mod session;
 pub mod tools;

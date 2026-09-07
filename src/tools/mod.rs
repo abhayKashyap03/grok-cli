@@ -297,6 +297,12 @@ impl ToolRegistry {
     pub fn read_only(&self) -> Self {
         Self { tools: self.tools.iter().filter(|t| !t.kind().mutates()).cloned().collect() }
     }
+
+    /// Drop one tool by name. Used to keep `task` out of a subagent's toolset,
+    /// so subagents cannot spawn subagents.
+    pub fn without(&self, name: &str) -> Self {
+        Self { tools: self.tools.iter().filter(|t| t.name() != name).cloned().collect() }
+    }
 }
 
 /// Build a JSON-schema object for a tool's parameters.
