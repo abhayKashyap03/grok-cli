@@ -19,12 +19,16 @@
 
 pub mod agent;
 pub mod api;
+pub mod cli;
+pub mod commands;
 pub mod config;
+pub mod headless;
 pub mod hooks;
 pub mod mcp;
 pub mod permissions;
 pub mod session;
 pub mod tools;
+pub mod tui;
 pub mod util;
 
 /// The user-facing product name, used in the banner and the system prompt.

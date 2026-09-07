@@ -32,8 +32,6 @@
 pub mod prompt;
 pub mod subagent;
 
-use std::sync::Arc;
-
 use anyhow::Result;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -82,9 +80,10 @@ pub enum AgentEvent {
     TurnComplete { stop_reason: StopReason },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum StopReason {
     /// The model finished its answer.
+    #[default]
     Complete,
     /// The user interrupted.
     Interrupted,
@@ -724,6 +723,7 @@ pub(crate) mod tests_support {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use std::sync::Arc;
     use tests_support::config_at as test_config;
 
     fn test_agent(workspace: PathBuf) -> Agent {
