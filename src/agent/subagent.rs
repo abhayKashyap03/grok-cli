@@ -30,10 +30,11 @@ use std::sync::Arc;
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::{Map, Value};
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc};
 
 use crate::api::{ApiClient, Message, RequestOptions, ToolSpec};
 use crate::config::Config;
+use crate::permissions::{Decision, PermissionEngine};
 use crate::tools::{Tool, ToolContext, ToolKind, ToolOutcome, ToolRegistry, object_schema, prop};
 use crate::util;
 
@@ -159,6 +160,17 @@ pub struct TaskTool {
     client: ApiClient,
     /// Progress events, so a long delegation is not a silent pause.
     events: mpsc::Sender<super::AgentEvent>,
+    /// Permission checks for the subagent's own tool calls.
+    ///
+    /// Restricting the subagent's *toolset* is not a security boundary on its
+    /// own: a subagent granted `bash` would otherwise run commands the parent's
+    /// deny rules forbid, unprompted, because nothing on that path consulted
+    /// the engine. It shares the parent's mode cell, so plan mode and every
+    /// mode switch apply to delegated work too.
+    permissions: Mutex<PermissionEngine>,
+    /// Channel for asking the user about a delegated call. Absent means
+    /// anything that would prompt is refused instead.
+    permission_tx: Option<mpsc::Sender<super::PermissionRequest>>,
 }
 
 impl TaskTool {
@@ -167,13 +179,101 @@ impl TaskTool {
         config: Config,
         parent_tools: ToolRegistry,
         events: mpsc::Sender<super::AgentEvent>,
+        permissions: PermissionEngine,
+        permission_tx: Option<mpsc::Sender<super::PermissionRequest>>,
     ) -> Result<Self> {
         let client = ApiClient::new(&config.api_key, &config.base_url)?;
-        Ok(Self { definitions, config, parent_tools, client, events })
+        Ok(Self {
+            definitions,
+            config,
+            parent_tools,
+            client,
+            events,
+            permissions: Mutex::new(permissions),
+            permission_tx,
+        })
     }
 
     fn find(&self, name: &str) -> Option<&SubagentDefinition> {
         self.definitions.iter().find(|d| d.name == name)
+    }
+
+    /// Emit a progress note, dropping it if nobody is listening.
+    ///
+    /// Deliberately `try_send` rather than `send().await`. Progress is
+    /// advisory, and awaiting it means a full or unread channel silently wedges
+    /// the subagent mid-run — which is exactly what happened when the tool was
+    /// registered with a bootstrap channel that had no receiver draining it.
+    fn report(&self, agent: &str, text: String) {
+        let _ = self
+            .events
+            .try_send(super::AgentEvent::SubagentProgress { agent: agent.to_string(), text });
+    }
+
+    /// Permission-check one delegated tool call.
+    ///
+    /// `Err` carries the message the subagent sees as its tool result, so a
+    /// refusal is something it can work around rather than a dead end.
+    async fn authorize(
+        &self,
+        agent_name: &str,
+        tool: &Arc<dyn Tool>,
+        args: &Value,
+        argument: &str,
+        ctx: &ToolContext,
+    ) -> Result<(), String> {
+        let decision = {
+            // Scoped so the guard is never held across an await.
+            let engine = self.permissions.lock().await;
+            engine.evaluate(tool.name(), tool.kind(), argument)
+        };
+
+        match decision {
+            Decision::Allow { .. } => Ok(()),
+            Decision::Deny { reason } => {
+                Err(format!("Tool call refused: {reason}. Report this back rather than retrying."))
+            }
+            Decision::Ask => {
+                let Some(tx) = &self.permission_tx else {
+                    return Err(format!(
+                        "Tool call refused: `{}` needs approval, and this run cannot prompt. Report what you wanted to do and why.",
+                        tool.name()
+                    ));
+                };
+
+                let (respond, rx) = tokio::sync::oneshot::channel();
+                let request = super::PermissionRequest {
+                    tool_name: tool.name().to_string(),
+                    // Attribute it, so the user knows a delegated agent is
+                    // asking rather than the conversation they can see.
+                    summary: format!("[{agent_name}] {}", tool.summarize(args)),
+                    argument: argument.to_string(),
+                    preview: None,
+                    respond,
+                };
+                if tx.send(request).await.is_err() {
+                    return Err("Tool call refused: nobody could be asked.".to_string());
+                }
+
+                let answer = tokio::select! {
+                    biased;
+                    () = ctx.cancel.cancelled() => super::PermissionResponse::Reject,
+                    answer = rx => answer.unwrap_or(super::PermissionResponse::Reject),
+                };
+
+                match answer {
+                    super::PermissionResponse::Reject => Err(
+                        "Tool call refused: the user declined. Report what you wanted to do instead of retrying."
+                            .to_string(),
+                    ),
+                    super::PermissionResponse::Always => {
+                        self.permissions.lock().await.grant_for_session(tool.name(), argument);
+                        Ok(())
+                    }
+                    super::PermissionResponse::Once => Ok(()),
+                }
+            }
+        }
     }
 }
 
@@ -281,13 +381,7 @@ impl Tool for TaskTool {
 
             let Some(calls) = completion.message.tool_calls.filter(|c| !c.is_empty()) else {
                 let answer = completion.message.content.unwrap_or_default();
-                let _ = self
-                    .events
-                    .send(super::AgentEvent::SubagentProgress {
-                        agent: agent_name.to_string(),
-                        text: format!("finished after {iterations} steps"),
-                    })
-                    .await;
+                self.report(agent_name, format!("finished after {iterations} steps"));
                 return Ok(ToolOutcome::ok(if answer.trim().is_empty() {
                     format!("subagent `{agent_name}` returned no answer")
                 } else {
@@ -296,30 +390,31 @@ impl Tool for TaskTool {
                 .with_summary(format!("{agent_name}, {iterations} steps")));
             };
 
-            // Subagents run without prompting. They are confined to a subset of
-            // already-permitted tools, and a prompt from a nested loop the user
-            // cannot see the context for is worse than no prompt at all.
+            // Every delegated call goes through the same permission engine as a
+            // top-level one. Restricting the toolset alone is not a boundary:
+            // without this, a subagent with `bash` runs commands the parent's
+            // deny rules forbid, in plan mode, with nobody asked.
             for call in calls {
                 let result = match tools.get(&call.function.name) {
                     None => format!("unknown tool `{}`", call.function.name),
                     Some(tool) => match call.parsed_arguments() {
                         Err(e) => format!("could not parse arguments: {e}"),
-                        Ok(args) => match tool.run(args, ctx).await {
-                            Ok(o) => o.content,
-                            Err(e) => format!("{} failed: {e}", call.function.name),
-                        },
+                        Ok(args) => {
+                            let argument = super::primary_argument(&args);
+                            match self.authorize(agent_name, &tool, &args, &argument, ctx).await {
+                                Err(reason) => reason,
+                                Ok(()) => match tool.run(args, ctx).await {
+                                    Ok(o) => o.content,
+                                    Err(e) => format!("{} failed: {e}", call.function.name),
+                                },
+                            }
+                        }
                     },
                 };
                 messages.push(Message::tool_result(&call.id, result));
             }
 
-            let _ = self
-                .events
-                .send(super::AgentEvent::SubagentProgress {
-                    agent: agent_name.to_string(),
-                    text: format!("step {iterations}"),
-                })
-                .await;
+            self.report(agent_name, format!("step {iterations}"));
         }
     }
 }
@@ -333,11 +428,20 @@ pub fn register_if_available(
     definitions: &[SubagentDefinition],
     config: &Config,
     events: mpsc::Sender<super::AgentEvent>,
+    permissions: PermissionEngine,
+    permission_tx: Option<mpsc::Sender<super::PermissionRequest>>,
 ) -> Result<()> {
     if definitions.is_empty() {
         return Ok(());
     }
-    let task = TaskTool::new(definitions.to_vec(), config.clone(), registry.clone(), events)?;
+    let task = TaskTool::new(
+        definitions.to_vec(),
+        config.clone(),
+        registry.clone(),
+        events,
+        permissions,
+        permission_tx,
+    )?;
     registry.register(Arc::new(task));
     Ok(())
 }
@@ -414,13 +518,34 @@ mod tests {
         assert_eq!(found[0].name, "good");
     }
 
+    #[tokio::test]
+    async fn progress_reporting_never_blocks_when_nobody_is_listening() {
+        // The tool is registered at startup with a placeholder channel that has
+        // no reader. Awaiting a send on it wedges the subagent the moment the
+        // buffer fills — which is a hang, not a dropped notification.
+        let (tx, _rx) = mpsc::channel(2);
+        let config = crate::agent::tests_support::config();
+        let engine = PermissionEngine::from_config(&config);
+        let tool = TaskTool::new(vec![], config, ToolRegistry::new(), tx, engine, None).unwrap();
+
+        let finished = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            for i in 0..100 {
+                tool.report("auditor", format!("step {i}"));
+            }
+        })
+        .await;
+
+        assert!(finished.is_ok(), "reporting progress must not block on a full channel");
+    }
+
     #[test]
     fn task_is_not_registered_when_no_subagents_exist() {
         let mut registry = ToolRegistry::with_builtins();
         let (tx, _rx) = mpsc::channel(1);
         let config = crate::agent::tests_support::config();
+        let engine = PermissionEngine::from_config(&config);
 
-        register_if_available(&mut registry, &[], &config, tx).unwrap();
+        register_if_available(&mut registry, &[], &config, tx, engine, None).unwrap();
         assert!(registry.get("task").is_none(), "nothing to delegate to");
     }
 
@@ -437,7 +562,8 @@ mod tests {
             model: None,
         }];
 
-        register_if_available(&mut registry, &defs, &config, tx).unwrap();
+        let engine = PermissionEngine::from_config(&config);
+        register_if_available(&mut registry, &defs, &config, tx, engine, None).unwrap();
         let task = registry.get("task").expect("task is available");
         assert!(task.spec().function.description.contains("Delegate"));
         assert!(task.spec().function.parameters["properties"]["agent"]["description"]

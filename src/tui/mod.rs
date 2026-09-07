@@ -371,12 +371,20 @@ pub async fn run(mut agent: Agent, store: Option<SessionStore>) -> Result<()> {
         app.notice(format!("This session will not be saved: {err}"), NoticeLevel::Warning);
     }
 
+    // Grabbed before the agent moves behind the mutex, so mode changes never
+    // need that lock.
+    let mode_cell = agent.permissions.mode_cell();
+
     let (perm_tx, mut perm_rx) = mpsc::channel::<PermissionRequest>(8);
     agent = agent.with_permission_channel(perm_tx);
     agent.refresh_system_prompt(&[]);
 
-    let agent = Arc::new(Mutex::new(agent));
     let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(512);
+    // The `task` tool was built at startup with a placeholder channel; give it
+    // the real one so subagent progress reaches the status bar.
+    agent.rewire_subagent_events(event_tx.clone());
+
+    let agent = Arc::new(Mutex::new(agent));
 
     let mut terminal = setup_terminal()?;
     let mut keys = EventStream::new();
@@ -439,6 +447,7 @@ pub async fn run(mut agent: Agent, store: Option<SessionStore>) -> Result<()> {
                             &mut turn,
                             &mut cancel,
                             store.as_ref(),
+                            &mode_cell,
                         )
                         .await;
                     }
@@ -539,6 +548,7 @@ async fn handle_terminal_event(
     turn: &mut Option<tokio::task::JoinHandle<()>>,
     cancel: &mut CancellationToken,
     store: Option<&SessionStore>,
+    mode_cell: &crate::permissions::ModeCell,
 ) {
     match event {
         Event::Mouse(mouse) => match mouse.kind {
@@ -549,7 +559,7 @@ async fn handle_terminal_event(
         Event::Paste(text) => app.textarea.insert_str(&text),
         Event::Resize(..) => app.scroll_to_bottom(),
         Event::Key(key) if key.kind == KeyEventKind::Press => {
-            handle_key(key, app, agent, event_tx, turn, cancel, store).await;
+            handle_key(key, app, agent, event_tx, turn, cancel, store, mode_cell).await;
         }
         _ => {}
     }
@@ -564,11 +574,12 @@ async fn handle_key(
     turn: &mut Option<tokio::task::JoinHandle<()>>,
     cancel: &mut CancellationToken,
     store: Option<&SessionStore>,
+    mode_cell: &crate::permissions::ModeCell,
 ) {
     // An open overlay takes every key: a modal that leaks keystrokes to the
     // input box behind it is how people accidentally send half a prompt.
     if !matches!(app.overlay, Overlay::None) {
-        handle_overlay_key(key, app, agent).await;
+        handle_overlay_key(key, app, mode_cell).await;
         return;
     }
 
@@ -621,8 +632,12 @@ async fn handle_key(
 
         // -- mode -----------------------------------------------------------
         KeyCode::BackTab => {
+            // No lock: a turn task holds the agent's mutex for its whole
+            // duration, so awaiting it here would freeze the entire event loop
+            // — including the Esc that would have cancelled the turn. The mode
+            // lives behind an atomic precisely so this key stays live.
             let mode = app.cycle_mode();
-            agent.lock().await.permissions.set_mode(mode);
+            mode_cell.store(mode);
             app.notice(format!("Mode: {} — {}", mode.as_str(), mode.describe()), NoticeLevel::Info);
         }
 
@@ -633,7 +648,7 @@ async fn handle_key(
                 return;
             }
             let text = app.textarea.take();
-            submit(text, app, agent, event_tx, turn, cancel, store).await;
+            submit(text, app, agent, event_tx, turn, cancel, store, mode_cell).await;
         }
 
         // -- editing --------------------------------------------------------
@@ -695,7 +710,11 @@ async fn handle_key(
     }
 }
 
-async fn handle_overlay_key(key: KeyEvent, app: &mut App, agent: &Arc<Mutex<Agent>>) {
+async fn handle_overlay_key(
+    key: KeyEvent,
+    app: &mut App,
+    mode_cell: &crate::permissions::ModeCell,
+) {
     match &mut app.overlay {
         Overlay::None => {}
 
@@ -761,14 +780,17 @@ async fn handle_overlay_key(key: KeyEvent, app: &mut App, agent: &Arc<Mutex<Agen
                 let Some(chosen) = chosen else { return };
                 match kind {
                     PickerKind::Model => {
+                        // Recorded on the App and pushed to the agent when the
+                        // next turn starts, which is the only point the lock is
+                        // already being taken. Locking here would block the
+                        // whole event loop if a turn were in flight.
                         app.model = chosen.value.clone();
-                        agent.lock().await.session.model = chosen.value.clone();
                         app.notice(format!("Model: {}", chosen.value), NoticeLevel::Success);
                     }
                     PickerKind::Mode => {
                         if let Some(mode) = PermissionMode::parse(&chosen.value) {
                             app.mode = mode;
-                            agent.lock().await.permissions.set_mode(mode);
+                            mode_cell.store(mode);
                             app.notice(
                                 format!("Mode: {} — {}", mode.as_str(), mode.describe()),
                                 NoticeLevel::Success,
@@ -804,6 +826,7 @@ async fn submit(
     turn: &mut Option<tokio::task::JoinHandle<()>>,
     cancel: &mut CancellationToken,
     store: Option<&SessionStore>,
+    mode_cell: &crate::permissions::ModeCell,
 ) {
     let action = commands::dispatch(&text, &app.config.workspace);
 
@@ -839,12 +862,12 @@ async fn submit(
             app.notice("Started a fresh conversation.", NoticeLevel::Success);
         }
         CommandAction::SetModel(model) => {
-            agent.lock().await.session.model = model.clone();
+            // Applied at the start of the next turn; see PickerKind::Model.
             app.model = model.clone();
             app.notice(format!("Model: {model}"), NoticeLevel::Success);
         }
         CommandAction::SetMode(mode) => {
-            agent.lock().await.permissions.set_mode(mode);
+            mode_cell.store(mode);
             app.mode = mode;
             app.notice(format!("Mode: {} — {}", mode.as_str(), mode.describe()), NoticeLevel::Success);
         }
@@ -964,6 +987,9 @@ async fn start_turn(
     {
         let mut guard = agent.lock().await;
         guard.reset_cancel(cancel.clone());
+        // Model changes made while idle are applied here, where the lock is
+        // taken anyway.
+        guard.session.model.clone_from(&app.model);
         guard.refresh_system_prompt(&[]);
     }
 

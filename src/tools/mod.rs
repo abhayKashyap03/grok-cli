@@ -150,6 +150,11 @@ pub struct ToolContext {
 
 impl ToolContext {
     pub fn new(workspace: PathBuf, cancel: CancellationToken) -> Self {
+        // Canonicalize the root once, here, so every containment check compares
+        // like with like. On macOS `/var` is itself a symlink to `/private/var`,
+        // so an un-canonicalized root makes every legitimate path look like an
+        // escape the moment symlinks are resolved.
+        let workspace = workspace.canonicalize().unwrap_or(workspace);
         Self {
             workspace,
             read_files: Arc::new(Mutex::new(HashMap::new())),
@@ -159,12 +164,21 @@ impl ToolContext {
         }
     }
 
+    /// Canonical key for the freshness map.
+    ///
+    /// Paths reach these methods both canonicalized (from the sandbox
+    /// resolver) and raw, and two spellings of the same file must not produce
+    /// two entries — that would silently disable the read-before-edit guard.
+    fn stamp_key(path: &std::path::Path) -> std::path::PathBuf {
+        path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+    }
+
     /// Record that `path` was read, so a later edit can verify freshness.
     pub async fn mark_read(&self, path: &std::path::Path) {
         if let Ok(meta) = tokio::fs::metadata(path).await
             && let Ok(mtime) = meta.modified()
         {
-            self.read_files.lock().await.insert(path.to_path_buf(), mtime);
+            self.read_files.lock().await.insert(Self::stamp_key(path), mtime);
         }
     }
 
@@ -176,7 +190,7 @@ impl ToolContext {
             return None;
         };
         let stamps = self.read_files.lock().await;
-        match stamps.get(path) {
+        match stamps.get(&Self::stamp_key(path)) {
             None => Some(format!(
                 "{} has not been read in this session. Read it first so the edit applies to its current contents.",
                 path.display()

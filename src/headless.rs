@@ -56,6 +56,9 @@ pub async fn run(agent: &mut Agent, prompt: &str, mcp_failures: &[(String, Strin
     });
 
     let (tx, mut rx) = mpsc::channel::<AgentEvent>(512);
+    // Same rewiring as the TUI: the `task` tool starts with a placeholder
+    // channel, so subagent progress would otherwise never reach stderr.
+    agent.rewire_subagent_events(tx.clone());
 
     // Collect the answer while streaming progress to stderr, so a long run
     // shows signs of life without polluting stdout.

@@ -30,18 +30,63 @@ const MAX_WALK_ENTRIES: usize = 200_000;
 
 /// Resolve `path` inside the workspace, rejecting escapes.
 ///
-/// Both the resolution *and* an explicit containment check are required:
-/// resolution alone would happily produce `/etc/passwd` from `../../etc/passwd`.
+/// Two checks, and both are necessary:
+///
+/// 1. **Lexical.** Catches `../../etc/passwd` even when nothing on that path
+///    exists yet, which matters for a tool creating a new file.
+/// 2. **Physical.** Resolves symlinks and re-checks containment. Without this a
+///    symlink inside the workspace — trivially created by an earlier `bash`
+///    call, or simply checked into a cloned repository — reads and writes
+///    anywhere on the disk while passing the lexical check cleanly.
+///
+/// The physical check cannot simply `canonicalize` the whole path: that fails
+/// when the file does not exist yet. It canonicalizes the deepest *existing*
+/// ancestor instead, then rebuilds the remainder on top, so a new file inherits
+/// the containment verdict of the directory it will live in.
 fn resolve_in_workspace(ctx: &ToolContext, path: &str) -> Result<PathBuf, String> {
-    let resolved = util::resolve(&ctx.workspace, path);
-    if util::is_within(&ctx.workspace, &resolved) {
-        return Ok(resolved);
+    let outside = |resolved: &Path| {
+        format!(
+            "{path} resolves to {}, which is outside the workspace ({}). Tools may only touch files under the workspace root.",
+            resolved.display(),
+            ctx.workspace.display()
+        )
+    };
+
+    let lexical = util::resolve(&ctx.workspace, path);
+    if !util::is_within(&ctx.workspace, &lexical) {
+        return Err(outside(&lexical));
     }
-    Err(format!(
-        "{path} resolves to {}, which is outside the workspace ({}). Tools may only touch files under the workspace root.",
-        resolved.display(),
-        ctx.workspace.display()
-    ))
+
+    // Walk up to the deepest component that exists on disk. `exists()` follows
+    // symlinks, so a link is "existing" and gets canonicalized — which is
+    // exactly what surfaces an escape.
+    let mut existing: &Path = &lexical;
+    let mut trailing: Vec<std::ffi::OsString> = Vec::new();
+    while !existing.exists() {
+        match (existing.file_name(), existing.parent()) {
+            (Some(name), Some(parent)) => {
+                trailing.push(name.to_owned());
+                existing = parent;
+            }
+            // Ran out of ancestors without finding anything real.
+            _ => return Err(outside(&lexical)),
+        }
+    }
+
+    let Ok(canonical) = existing.canonicalize() else { return Err(outside(&lexical)) };
+    if !util::is_within(&ctx.workspace, &canonical) {
+        return Err(format!(
+            "{path} resolves through a symlink to {}, which is outside the workspace ({}). Tools may only touch files under the workspace root.",
+            canonical.display(),
+            ctx.workspace.display()
+        ));
+    }
+
+    let mut resolved = canonical;
+    for name in trailing.into_iter().rev() {
+        resolved.push(name);
+    }
+    Ok(resolved)
 }
 
 /// Pull a required string argument, with a message the model can act on.

@@ -177,6 +177,38 @@ impl Agent {
         &self.tool_context
     }
 
+    /// Point the `task` tool at the driver's event channel.
+    ///
+    /// The tool is registered at startup, before a front end exists, so it
+    /// begins life holding a placeholder channel nobody reads. A front end
+    /// calls this once it has a real one; without it, subagent progress is
+    /// silently discarded and a long delegation looks like a hang.
+    pub fn rewire_subagent_events(&mut self, events: mpsc::Sender<AgentEvent>) {
+        if self.subagents.is_empty() {
+            return;
+        }
+        // Rebuild against the registry minus `task` itself, so the tool does
+        // not end up holding a stale clone of a registry containing itself.
+        let parent = self.tools.without("task");
+        // Share the parent's mode cell so plan mode and any later mode switch
+        // govern delegated work too, and hand over the permission channel so a
+        // subagent can ask rather than silently failing.
+        let permissions = PermissionEngine::sharing_mode(
+            &self.config.permissions,
+            self.permissions.shared_mode(),
+        );
+        if let Ok(task) = subagent::TaskTool::new(
+            self.subagents.clone(),
+            self.config.clone(),
+            parent,
+            events,
+            permissions,
+            self.permission_tx.clone(),
+        ) {
+            self.tools.register(std::sync::Arc::new(task));
+        }
+    }
+
     fn request_options(&self) -> RequestOptions {
         RequestOptions {
             model: self.session.model.clone(),

@@ -152,7 +152,14 @@ pub async fn main() -> Result<()> {
     // sender with its own once it starts.
     let (bootstrap_tx, _bootstrap_rx) = mpsc::channel(64);
     let definitions = subagent::discover(&workspace);
-    subagent::register_if_available(&mut tools, &definitions, &config, bootstrap_tx)?;
+    subagent::register_if_available(
+        &mut tools,
+        &definitions,
+        &config,
+        bootstrap_tx,
+        crate::permissions::PermissionEngine::from_config(&config),
+        None,
+    )?;
 
     let mut agent = Agent::new(config, session, tools, cancel)?;
 
