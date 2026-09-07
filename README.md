@@ -204,12 +204,12 @@ test commands, real conventions, the gotcha that has already bitten someone.
 ## Development
 
 ```bash
-cargo test           # 281 tests
+cargo test           # 305 tests
 cargo clippy --all-targets
 cargo build --release
 ```
 
-Four layers: unit tests beside the code, render tests driving the real UI
+Five layers: unit tests beside the code, render tests driving the real UI
 against an in-memory terminal, end-to-end tests driving the real agent against
 a scripted mock of the xAI API, and sandbox tests probing the security
 boundaries directly.

@@ -8,7 +8,7 @@ it has the reasoning behind the layering, which the code does not repeat.
 ## Commands
 
 ```bash
-cargo test                        # 281 tests; run this before every commit
+cargo test                        # 305 tests; run this before every commit
 cargo clippy --all-targets        # must stay clean
 cargo build
 cargo test --test end_to_end      # agent against a scripted mock API

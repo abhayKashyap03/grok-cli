@@ -342,7 +342,7 @@ unattended run into an unsupervised one; that is what `--yes` is for.
 
 ## Testing
 
-281 tests, in four layers:
+305 tests, in five layers:
 
 - **Unit tests** next to the code, covering the awkward cases directly: SSE
   frames split mid-JSON, parallel tool calls interleaved, `..` escaping the
@@ -356,6 +356,12 @@ unattended run into an unsupervised one; that is what `--yes` is for.
 - **Sandbox tests** probing the containment and delegation boundaries directly
   rather than through a model. A model that declines to attempt an escape
   proves nothing about whether the escape exists.
+- **Surface tests** (`tests/command_surface.rs`, `tests/tool_surface.rs`)
+  asserting properties of the whole *set* rather than of any one member: no
+  slash command may resolve to something that only looks like an answer, every
+  palette entry must be dispatchable, every tool must have a usable schema,
+  survive junk arguments, summarize without side effects, and refuse to leave
+  the workspace. A new command or tool added without those properties fails.
 
 Behaviour found only by running the real thing — the `edit_file` prefix
 corruption, the 0x0 terminal spin, the missing-TTY error — has a regression
